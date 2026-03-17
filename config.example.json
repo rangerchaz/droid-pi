@@ -6,5 +6,6 @@
   "frame_interval": 2.0,
   "audio_chunk_ms": 500,
   "jpeg_quality": 60,
+  "volume": 80,
   "speaker_device": "default"
 }

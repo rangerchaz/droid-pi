@@ -49,6 +49,7 @@ SAMPLE_RATE = config.get('sample_rate', 16000)
 FRAME_INTERVAL = config.get('frame_interval', 3.0)
 AUDIO_CHUNK_MS = config.get('audio_chunk_ms', 500)
 JPEG_QUALITY = config.get('jpeg_quality', 60)
+VOLUME = config.get('volume', 80)  # 0-100
 
 # Audio config
 CHANNELS = 1
@@ -145,9 +146,10 @@ class Speaker:
                 # Kill any stuck audio processes first
                 subprocess.run(['killall', '-q', 'aplay'], stderr=subprocess.DEVNULL)
 
-                # Decode with ffmpeg
+                # Decode with ffmpeg, apply volume filter
+                vol_filter = f'volume={VOLUME / 100.0}'
                 proc = subprocess.Popen(
-                    ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le',
+                    ['ffmpeg', '-i', 'pipe:0', '-af', vol_filter, '-f', 'wav', '-acodec', 'pcm_s16le',
                      '-ar', '24000', '-ac', '1', 'pipe:1'],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
@@ -254,6 +256,11 @@ async def run():
 
                             elif msg_type == 'error':
                                 print(f"[Error] {msg.get('message', '')}")
+
+                            elif msg_type == 'volume':
+                                global VOLUME
+                                VOLUME = max(0, min(100, msg.get('level', 80)))
+                                print(f"[Volume] Set to {VOLUME}%")
 
                             elif msg_type == 'servo':
                                 pan = msg.get('pan', 90)
