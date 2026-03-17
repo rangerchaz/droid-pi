@@ -138,25 +138,34 @@ class Speaker:
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
         global is_speaking
-        is_speaking = True
-        try:
-            # Decode with ffmpeg and play via aplay
-            proc = subprocess.Popen(
-                ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le',
-                 '-ar', '24000', '-ac', '1', 'pipe:1'],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            wav_data, _ = proc.communicate(input=audio_bytes)
-            if wav_data and len(wav_data) > 44:
-                play = subprocess.Popen(
-                    ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+
+        with self.lock:
+            is_speaking = True
+            try:
+                # Kill any stuck audio processes first
+                subprocess.run(['killall', '-q', 'aplay'], stderr=subprocess.DEVNULL)
+
+                # Decode with ffmpeg
+                proc = subprocess.Popen(
+                    ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le',
+                     '-ar', '24000', '-ac', '1', 'pipe:1'],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
-                play.communicate(input=wav_data[44:])
-        except Exception as e:
-            print(f"[Speaker] Error: {e}")
-        finally:
-            is_speaking = False
+                wav_data, _ = proc.communicate(input=audio_bytes, timeout=10)
+
+                if wav_data and len(wav_data) > 44:
+                    play = subprocess.Popen(
+                        ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    )
+                    play.communicate(input=wav_data[44:], timeout=30)
+            except subprocess.TimeoutExpired:
+                print("[Speaker] Timeout — killing audio")
+                subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"[Speaker] Error: {e}")
+            finally:
+                is_speaking = False
 
     def close(self):
         pass
