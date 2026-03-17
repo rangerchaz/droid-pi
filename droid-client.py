@@ -151,16 +151,20 @@ class Speaker:
                      '-ar', '24000', '-ac', '1', 'pipe:1'],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
-                wav_data, _ = proc.communicate(input=audio_bytes, timeout=10)
+                wav_data, _ = proc.communicate(input=audio_bytes, timeout=30)
 
                 if wav_data and len(wav_data) > 44:
                     play = subprocess.Popen(
                         ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
                     )
-                    play.communicate(input=wav_data[44:], timeout=30)
+                    play.communicate(input=wav_data[44:], timeout=60)
             except subprocess.TimeoutExpired:
                 print("[Speaker] Timeout — killing audio")
+                try:
+                    proc.kill()
+                except:
+                    pass
                 subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(f"[Speaker] Error: {e}")
