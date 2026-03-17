@@ -62,6 +62,10 @@ is_speaking = False
 
 def signal_handler(sig, frame):
     global running
+    if not running:
+        # Second Ctrl+C = force exit
+        print("\nForce quit.")
+        os._exit(0)
     print("\nShutting down...")
     running = False
 
