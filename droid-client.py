@@ -167,6 +167,19 @@ class Speaker:
             finally:
                 is_speaking = False
 
+    def keep_alive(self):
+        """Play silence to prevent audio device from sleeping."""
+        try:
+            # 0.1s of silence at 24kHz 16-bit mono
+            silence = b'\x00' * 4800
+            proc = subprocess.Popen(
+                ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            proc.communicate(input=silence, timeout=2)
+        except:
+            pass
+
     def close(self):
         pass
 
@@ -202,6 +215,7 @@ async def run():
                 }))
 
                 last_frame_time = 0
+                last_keepalive = 0
 
                 while running and connected:
                     try:
@@ -250,6 +264,12 @@ async def run():
                                     'timestamp': now
                                 }))
                                 last_frame_time = now
+
+                        # Keep audio device alive (every 10s)
+                        if now - last_keepalive > 10:
+                            last_keepalive = now
+                            if not is_speaking:
+                                threading.Thread(target=speaker.keep_alive, daemon=True).start()
 
                         # Send buffered audio
                         audio = mic.get_audio()
