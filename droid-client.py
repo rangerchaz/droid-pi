@@ -196,6 +196,10 @@ async def run():
     speaker = Speaker()
     mic.start()
 
+    # Initialize servo controller (safe to run without hardware)
+    from servo import ServoController
+    servos = ServoController()
+
     url = SERVER
     if TOKEN:
         url += ('&' if '?' in url else '?') + f'token={TOKEN}'
@@ -251,6 +255,11 @@ async def run():
                             elif msg_type == 'error':
                                 print(f"[Error] {msg.get('message', '')}")
 
+                            elif msg_type == 'servo':
+                                pan = msg.get('pan', 90)
+                                tilt = msg.get('tilt', 90)
+                                servos.look_at(pan, tilt)
+
                             elif msg_type == 'ping':
                                 await ws.send(json.dumps({'type': 'pong'}))
 
@@ -300,6 +309,7 @@ async def run():
     camera.close()
     mic.close()
     speaker.close()
+    servos.close()
     print("[Droid] Shutdown complete")
 
 
