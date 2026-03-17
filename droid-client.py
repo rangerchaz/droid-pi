@@ -12,8 +12,6 @@ import os
 import signal
 import time
 import threading
-import wave
-import tempfile
 import subprocess
 
 try:
@@ -31,7 +29,7 @@ except ImportError:
 try:
     import websockets
 except ImportError:
-    print("ERROR: websockets not installed. Run: pip3 install websockets")
+    print("ERROR: websockets not installed. Run: pip3 install websockets --break-system-packages")
     sys.exit(1)
 
 
@@ -48,7 +46,7 @@ SERVER = config.get('server', 'wss://droid.turkeycode.ai/ws/device')
 TOKEN = config.get('token', '')
 CAMERA_INDEX = config.get('camera_index', 0)
 SAMPLE_RATE = config.get('sample_rate', 16000)
-FRAME_INTERVAL = config.get('frame_interval', 2.0)
+FRAME_INTERVAL = config.get('frame_interval', 3.0)
 AUDIO_CHUNK_MS = config.get('audio_chunk_ms', 500)
 JPEG_QUALITY = config.get('jpeg_quality', 60)
 
@@ -59,8 +57,7 @@ CHUNK = int(SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
 
 # State
 running = True
-ws_connection = None
-is_speaking = False  # True while playing TTS — mute mic to prevent echo
+is_speaking = False
 
 
 def signal_handler(sig, frame):
@@ -77,7 +74,6 @@ class Camera:
         self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {index}")
-        # Lower resolution for bandwidth
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         print(f"[Camera] Opened camera {index}")
@@ -112,7 +108,7 @@ class Microphone:
         print("[Mic] Listening")
 
     def _callback(self, data, frame_count, time_info, status):
-        if not is_speaking:  # Mute during TTS playback
+        if not is_speaking:
             with self.lock:
                 self.buffer.append(data)
         return (None, pyaudio.paContinue)
@@ -134,66 +130,35 @@ class Microphone:
 
 class Speaker:
     def __init__(self):
-        self.pa = pyaudio.PyAudio()
         self.lock = threading.Lock()
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
-        """Play audio bytes through speaker. Handles mp3 and wav."""
         global is_speaking
         is_speaking = True
-
         try:
-            if audio_format == 'wav':
-                self._play_wav(audio_bytes)
-            else:
-                # Decode mp3 to wav using ffmpeg
-                self._play_mp3(audio_bytes)
+            # Decode with ffmpeg and play via aplay
+            proc = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le',
+                 '-ar', '24000', '-ac', '1', 'pipe:1'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            wav_data, _ = proc.communicate(input=audio_bytes)
+            if wav_data and len(wav_data) > 44:
+                play = subprocess.Popen(
+                    ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                play.communicate(input=wav_data[44:])
         except Exception as e:
             print(f"[Speaker] Error: {e}")
         finally:
             is_speaking = False
 
-    def _play_wav(self, data):
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
-            f.write(data)
-            f.flush()
-            wf = wave.open(f.name, 'rb')
-            stream = self.pa.open(
-                format=self.pa.get_format_from_width(wf.getsampwidth()),
-                channels=wf.getnchannels(),
-                rate=wf.getframerate(),
-                output=True
-            )
-            chunk = 1024
-            out = wf.readframes(chunk)
-            while out and running:
-                stream.write(out)
-                out = wf.readframes(chunk)
-            stream.stop_stream()
-            stream.close()
-            wf.close()
-
-    def _play_mp3(self, data):
-        """Decode mp3 with ffmpeg and play raw PCM."""
-        proc = subprocess.Popen(
-            ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le',
-             '-ar', '24000', '-ac', '1', 'pipe:1'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        wav_data, _ = proc.communicate(input=data)
-        if wav_data and len(wav_data) > 44:  # Skip WAV header
-            stream = self.pa.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True)
-            stream.write(wav_data[44:])
-            stream.stop_stream()
-            stream.close()
-
     def close(self):
-        self.pa.terminate()
+        pass
 
 
 async def run():
-    global ws_connection
-
     print(f"[Droid] Connecting to {SERVER}")
 
     camera = Camera(CAMERA_INDEX)
@@ -209,11 +174,11 @@ async def run():
 
     while running:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10,
+            async with websockets.connect(url, ping_interval=30, ping_timeout=15,
                                           max_size=10 * 1024 * 1024) as ws:
-                ws_connection = ws
                 reconnect_delay = 1
                 print("[Droid] Connected!")
+                connected = True
 
                 # Send device info
                 await ws.send(json.dumps({
@@ -223,13 +188,69 @@ async def run():
                     'capabilities': ['camera', 'microphone', 'speaker']
                 }))
 
-                # Start concurrent tasks
-                await asyncio.gather(
-                    send_frames(ws, camera),
-                    send_audio(ws, mic),
-                    receive_messages(ws, speaker),
-                    return_exceptions=True
-                )
+                last_frame_time = 0
+
+                while running and connected:
+                    try:
+                        # Check for incoming messages (non-blocking, short timeout)
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=0.2)
+                            msg = json.loads(raw)
+                            msg_type = msg.get('type', '')
+
+                            if msg_type == 'speak':
+                                audio_b64 = msg.get('audio', '')
+                                if audio_b64:
+                                    audio_bytes = base64.b64decode(audio_b64)
+                                    text = msg.get('text', '')
+                                    if text:
+                                        print(f'[Droid] "{text}"')
+                                    threading.Thread(
+                                        target=speaker.play_audio,
+                                        args=(audio_bytes, msg.get('format', 'mp3')),
+                                        daemon=True
+                                    ).start()
+
+                            elif msg_type == 'text':
+                                print(f"[Droid] {msg.get('text', '')}")
+
+                            elif msg_type == 'status':
+                                print(f"[Status] {msg.get('message', '')}")
+
+                            elif msg_type == 'error':
+                                print(f"[Error] {msg.get('message', '')}")
+
+                            elif msg_type == 'ping':
+                                await ws.send(json.dumps({'type': 'pong'}))
+
+                        except asyncio.TimeoutError:
+                            pass  # No message, that's fine
+
+                        # Send camera frame if interval elapsed
+                        now = time.time()
+                        if now - last_frame_time >= FRAME_INTERVAL:
+                            jpeg = camera.capture_jpeg()
+                            if jpeg:
+                                await ws.send(json.dumps({
+                                    'type': 'frame',
+                                    'data': base64.b64encode(jpeg).decode('ascii'),
+                                    'timestamp': now
+                                }))
+                                last_frame_time = now
+
+                        # Send buffered audio
+                        audio = mic.get_audio()
+                        if audio:
+                            await ws.send(json.dumps({
+                                'type': 'audio',
+                                'data': base64.b64encode(audio).decode('ascii'),
+                                'sample_rate': SAMPLE_RATE,
+                                'channels': CHANNELS,
+                                'format': 'pcm_s16le'
+                            }))
+
+                    except websockets.ConnectionClosed:
+                        connected = False
 
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
             print(f"[Droid] Disconnected: {e}. Reconnecting in {reconnect_delay}s...")
@@ -245,84 +266,9 @@ async def run():
     print("[Droid] Shutdown complete")
 
 
-async def send_frames(ws, camera):
-    """Send camera frames at configured interval."""
-    while running:
-        jpeg = camera.capture_jpeg()
-        if jpeg:
-            msg = json.dumps({
-                'type': 'frame',
-                'data': base64.b64encode(jpeg).decode('ascii'),
-                'timestamp': time.time()
-            })
-            await ws.send(msg)
-        await asyncio.sleep(FRAME_INTERVAL)
-
-
-async def send_audio(ws, mic):
-    """Send mic audio chunks to server for STT."""
-    while running:
-        audio = mic.get_audio()
-        if audio:
-            msg = json.dumps({
-                'type': 'audio',
-                'data': base64.b64encode(audio).decode('ascii'),
-                'sample_rate': SAMPLE_RATE,
-                'channels': CHANNELS,
-                'format': 'pcm_s16le'
-            })
-            await ws.send(msg)
-        await asyncio.sleep(0.1)
-
-
-async def receive_messages(ws, speaker):
-    """Receive and handle messages from server."""
-    async for message in ws:
-        try:
-            msg = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-
-        msg_type = msg.get('type', '')
-
-        if msg_type == 'speak':
-            # TTS audio to play
-            audio_b64 = msg.get('audio', '')
-            audio_format = msg.get('format', 'mp3')
-            if audio_b64:
-                audio_bytes = base64.b64decode(audio_b64)
-                text = msg.get('text', '')
-                if text:
-                    print(f"[Droid] \"{text}\"")
-                # Play in thread to not block receive loop
-                threading.Thread(
-                    target=speaker.play_audio,
-                    args=(audio_bytes, audio_format),
-                    daemon=True
-                ).start()
-
-        elif msg_type == 'text':
-            # Text-only response (no TTS)
-            print(f"[Droid] {msg.get('text', '')}")
-
-        elif msg_type == 'status':
-            print(f"[Status] {msg.get('message', '')}")
-
-        elif msg_type == 'error':
-            print(f"[Error] {msg.get('message', '')}")
-
-        elif msg_type == 'vision_processed':
-            # Server processed a frame, may include next look timing
-            next_ms = msg.get('nextLookMs', 2000)
-            # Frame interval is handled server-side via this response
-
-        elif msg_type == 'ping':
-            await ws.send(json.dumps({'type': 'pong'}))
-
-
 if __name__ == '__main__':
     print("=" * 40)
     print("  DROID Pi Client")
-    print("  Camera + Mic → Server → Speaker")
+    print("  Camera + Mic -> Server -> Speaker")
     print("=" * 40)
     asyncio.run(run())
