@@ -7,5 +7,9 @@
   "audio_chunk_ms": 500,
   "jpeg_quality": 60,
   "volume": 80,
-  "speaker_device": "default"
+  "speaker_device": "default",
+  "wifi_networks": {
+    "HomeWiFi": "your-home-password",
+    "Chad-iPhone": "your-hotspot-password"
+  }
 }
