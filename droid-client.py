@@ -50,14 +50,17 @@ if not os.path.exists(CONFIG_PATH):
 with open(CONFIG_PATH) as f:
     config = json.load(f)
 
+# User config
 SERVER = config.get('server', 'wss://droid.turkeycode.ai/ws/device')
 TOKEN = config.get('token', '')
 CAMERA_INDEX = config.get('camera_index', 0)
-SAMPLE_RATE = config.get('sample_rate', 16000)
-FRAME_INTERVAL = config.get('frame_interval', 3.0)
-AUDIO_CHUNK_MS = config.get('audio_chunk_ms', 500)
-JPEG_QUALITY = config.get('jpeg_quality', 60)
-VOLUME = config.get('volume', 80)
+VOLUME = config.get('volume', 250)
+
+# Internal constants — not user-configurable
+SAMPLE_RATE = 16000
+FRAME_INTERVAL = 3.0
+AUDIO_CHUNK_MS = 500
+JPEG_QUALITY = 60
 
 # Sleep/Wake config
 IDLE_TIMEOUT = config.get('idle_timeout', 30)         # seconds without motion → sleep
@@ -133,23 +136,25 @@ def detect_motion(frame, threshold=MOTION_THRESHOLD, pct=MOTION_PIXEL_PCT):
 
 def do_sleep(ws_send_queue):
     """Transition to sleep state."""
-    global sleep_state
+    global sleep_state, camera
     if sleep_state == 'sleeping':
         return
     sleep_state = 'sleeping'
+    camera.disable()
     print("[Sleep] 💤 Sleeping — no activity for", IDLE_TIMEOUT, "seconds")
     ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'sleeping'}))
 
 
 def do_wake(reason, ws_send_queue):
     """Transition to awake state."""
-    global sleep_state, last_motion_time, noise_start_time, prev_frame_gray
+    global sleep_state, last_motion_time, noise_start_time, prev_frame_gray, camera
     if sleep_state == 'awake':
         return
     sleep_state = 'awake'
     last_motion_time = time.time()
     noise_start_time = None
     prev_frame_gray = None
+    camera.enable()
     print(f"[Sleep] ☀️ Waking — reason: {reason}")
     ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'awake'}))
 
@@ -157,13 +162,31 @@ def do_wake(reason, ws_send_queue):
 class Camera:
     def __init__(self, index=0):
         self.index = index
-        self.cap = cv2.VideoCapture(index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {index}")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.enabled = True
-        print(f"[Camera] Opened camera {index}")
+        self.cap = None
+        self.enabled = False
+        self._open_retries = 0
+        self._open()
+
+    def _open(self):
+        """Try to open camera. Don't crash if it fails — retry later."""
+        try:
+            self.cap = cv2.VideoCapture(self.index)
+            if not self.cap.isOpened():
+                print(f"[Camera] WARNING: Cannot open camera {self.index} — will retry")
+                self.cap = None
+                self.enabled = False
+                return False
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.enabled = True
+            self._open_retries = 0
+            print(f"[Camera] Opened camera {self.index}")
+            return True
+        except Exception as e:
+            print(f"[Camera] ERROR opening camera: {e}")
+            self.cap = None
+            self.enabled = False
+            return False
 
     def disable(self):
         self.enabled = False
@@ -172,18 +195,11 @@ class Camera:
             print("[Camera] Released — light off")
 
     def enable(self):
-        self.enabled = True
         if self.cap and self.cap.isOpened():
+            self.enabled = True
             print("[Camera] Already open")
             return
-        self.cap = cv2.VideoCapture(self.index)
-        if not self.cap.isOpened():
-            print("[Camera] ERROR: Failed to reopen camera!")
-            self.enabled = False
-            return
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        print("[Camera] Reopened — light on")
+        self._open()
 
     def capture_frame(self):
         """Return raw frame (for motion detection) and JPEG bytes."""
@@ -429,8 +445,10 @@ class Speaker:
         pass
 
 
+camera = None  # Global ref for sleep/wake
+
 async def run():
-    global last_motion_time, noise_start_time, sleep_state
+    global last_motion_time, noise_start_time, sleep_state, camera
 
     print(f"[Droid] Connecting to {SERVER}")
     print(f"[Sleep] {'Enabled' if SLEEP_ENABLED else 'Disabled'} — idle:{IDLE_TIMEOUT}s, rms:{RMS_THRESHOLD}, debounce:{WAKE_DEBOUNCE}s")
@@ -731,6 +749,11 @@ async def run():
 
                             # Send camera frame + check motion
                             if now - last_frame_time >= FRAME_INTERVAL:
+                                # Retry opening camera if it failed
+                                if camera.enabled and (camera.cap is None or not camera.cap.isOpened()):
+                                    camera._open_retries += 1
+                                    if camera._open_retries % 6 == 1:  # Try every ~30s (6 * 5s frame interval)
+                                        camera._open()
                                 frame, jpeg = camera.capture_frame()
                                 if jpeg:
                                     # Check for motion

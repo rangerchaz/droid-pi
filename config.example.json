@@ -2,14 +2,8 @@
   "server": "wss://droid.turkeycode.ai/ws/device",
   "token": "",
   "camera_index": 0,
-  "sample_rate": 16000,
-  "frame_interval": 2.0,
-  "audio_chunk_ms": 500,
-  "jpeg_quality": 60,
-  "volume": 80,
-  "speaker_device": "default",
-  "wifi_networks": {
-    "HomeWiFi": "your-home-password",
-    "Chad-iPhone": "your-hotspot-password"
-  }
+  "volume": 250,
+  "idle_timeout": 60,
+  "rms_threshold": 200,
+  "sleep_enabled": true
 }
