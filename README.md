@@ -53,9 +53,12 @@ The Pi is intentionally dumb. It captures audio/video, sends it over WebSocket, 
 | Part | Notes | ~Cost |
 |------|-------|-------|
 | Bluetooth speaker | Pairs via PulseAudio, voice-command switchable | $15+ |
-| PCA9685 servo board | Pan/tilt head tracking (I2C) | $5 |
+| PCA9685 servo board | Pan/tilt head tracking (I2C) — **not yet tested** | $5 |
+| Pan/tilt camera mount | SG90 servos + bracket — **not yet tested** | $10 |
 | Powered USB hub | Prevents undervoltage with multiple USB devices | $10 |
 | 3D printed body | STL files in the main droid repo | $5 filament |
+
+> ⚠️ **Servo/pan-tilt support is included but not yet tested.** The code is there (`servo.py`) but the PCA9685 board died during installation. Face tracking and idle glance movements are implemented but unverified on hardware.
 
 ### Tested On
 - Raspberry Pi 3 Model B (Debian 13 Trixie, aarch64)
@@ -234,7 +237,16 @@ Audio routes through PulseAudio when BT is active. Persistent `pacat` process wi
 
 ## Server
 
-This is just the Pi client. You need a droid server running to connect to. The server handles:
+This is just the Pi client. **You need an account on the droid server for it to work.**
+
+### Getting Started
+1. Sign up at **[droid.turkeycode.ai](https://droid.turkeycode.ai)**
+2. Create a droid in your dashboard
+3. Generate a device token from the dashboard → Hardware section
+4. Put the token in your `config.json`
+5. Run the client — it connects via WebSocket and you're live
+
+### What the Server Handles
 - Claude API calls (LLM + vision)
 - Groq Whisper (speech-to-text)
 - Edge TTS (text-to-speech)
@@ -242,9 +254,18 @@ This is just the Pi client. You need a droid server running to connect to. The s
 - Face recognition
 - Memory (SQLite — conversations, extractions, relationship graph)
 - Skills engine (60+ tools)
-- Dashboard (web UI for managing droids, faces, voices, billing)
+- Dashboard (web UI for managing droids, faces, voices, skills, billing)
 
-Server repo: [droid.turkeycode.ai](https://droid.turkeycode.ai)
+### Plans
+| Plan | Price | Tokens/mo | Vision/day |
+|------|-------|-----------|------------|
+| Trial | Free (7 days) | 500K | 100 |
+| Starter | $9.99/mo | 2M | 500 |
+| Pro | $24.99/mo | 8M | 2,000 |
+| Ultra | $49.99/mo | 30M | 5,000 |
+| BYOK | $4.99/mo | Unlimited | Unlimited |
+
+**BYOK (Bring Your Own Key):** Use your own Claude API key. $4.99/mo covers hosting only.
 
 ## Tips
 
