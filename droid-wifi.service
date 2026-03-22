@@ -1,0 +1,15 @@
+[Unit]
+Description=Droid WiFi Manager — AP fallback + config portal
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/mrcdcox/droid/wifi-manager.py
+WorkingDirectory=/home/mrcdcox/droid
+Restart=always
+RestartSec=10
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

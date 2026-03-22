@@ -2,6 +2,12 @@
 """
 Droid Pi Client — thin client that streams camera + mic to droid server,
 plays audio responses through speaker. All AI runs server-side.
+
+Sleep/Wake:
+  AWAKE + camera on → motion detection via frame differencing
+  AWAKE + no motion for idle_timeout → SLEEPING (camera stops, audio stops)
+  SLEEPING → noise above threshold for wake_debounce → AWAKE
+  Any server 'wake' message or noise → AWAKE
 """
 
 import asyncio
@@ -13,6 +19,8 @@ import signal
 import time
 import threading
 import subprocess
+import struct
+import math
 
 try:
     import cv2
@@ -49,7 +57,15 @@ SAMPLE_RATE = config.get('sample_rate', 16000)
 FRAME_INTERVAL = config.get('frame_interval', 3.0)
 AUDIO_CHUNK_MS = config.get('audio_chunk_ms', 500)
 JPEG_QUALITY = config.get('jpeg_quality', 60)
-VOLUME = config.get('volume', 80)  # 0-100
+VOLUME = config.get('volume', 80)
+
+# Sleep/Wake config
+IDLE_TIMEOUT = config.get('idle_timeout', 30)         # seconds without motion → sleep
+MOTION_THRESHOLD = config.get('motion_threshold', 5)    # pixel diff threshold (0-255)
+MOTION_PIXEL_PCT = config.get('motion_pixel_pct', 0.5)  # % pixels changed to count as motion
+RMS_THRESHOLD = config.get('rms_threshold', 500)         # RMS level to wake (16-bit PCM scale)
+WAKE_DEBOUNCE = config.get('wake_debounce', 0.5)         # seconds of noise to wake
+SLEEP_ENABLED = config.get('sleep_enabled', True)
 
 # Audio config
 CHANNELS = 1
@@ -59,12 +75,15 @@ CHUNK = int(SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
 # State
 running = True
 is_speaking = False
+sleep_state = 'awake'  # 'awake' | 'sleeping'
+last_motion_time = time.time()
+noise_start_time = None
+prev_frame_gray = None
 
 
 def signal_handler(sig, frame):
     global running
     if not running:
-        # Second Ctrl+C = force exit
         print("\nForce quit.")
         os._exit(0)
     print("\nShutting down...")
@@ -74,21 +93,107 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
+def compute_rms(pcm_data):
+    """Compute RMS energy of 16-bit PCM audio."""
+    if len(pcm_data) < 2:
+        return 0
+    count = len(pcm_data) // 2
+    fmt = f'<{count}h'
+    try:
+        samples = struct.unpack(fmt, pcm_data[:count * 2])
+    except struct.error:
+        return 0
+    if not samples:
+        return 0
+    sum_sq = sum(s * s for s in samples)
+    return math.sqrt(sum_sq / count)
+
+
+def detect_motion(frame, threshold=MOTION_THRESHOLD, pct=MOTION_PIXEL_PCT):
+    """Compare current frame to previous, return True if motion detected."""
+    global prev_frame_gray
+
+    # Convert to small grayscale
+    small = cv2.resize(frame, (160, 120))
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+    if prev_frame_gray is None:
+        prev_frame_gray = gray
+        return False
+
+    diff = cv2.absdiff(gray, prev_frame_gray)
+    prev_frame_gray = gray
+
+    changed = (diff > threshold).sum()
+    total = 160 * 120
+    percent = (changed / total) * 100
+
+    return percent >= pct
+
+
+def do_sleep(ws_send_queue):
+    """Transition to sleep state."""
+    global sleep_state
+    if sleep_state == 'sleeping':
+        return
+    sleep_state = 'sleeping'
+    print("[Sleep] 💤 Sleeping — no activity for", IDLE_TIMEOUT, "seconds")
+    ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'sleeping'}))
+
+
+def do_wake(reason, ws_send_queue):
+    """Transition to awake state."""
+    global sleep_state, last_motion_time, noise_start_time, prev_frame_gray
+    if sleep_state == 'awake':
+        return
+    sleep_state = 'awake'
+    last_motion_time = time.time()
+    noise_start_time = None
+    prev_frame_gray = None
+    print(f"[Sleep] ☀️ Waking — reason: {reason}")
+    ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'awake'}))
+
+
 class Camera:
     def __init__(self, index=0):
+        self.index = index
         self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {index}")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.enabled = True
         print(f"[Camera] Opened camera {index}")
 
-    def capture_jpeg(self):
+    def disable(self):
+        self.enabled = False
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            print("[Camera] Released — light off")
+
+    def enable(self):
+        self.enabled = True
+        if self.cap and self.cap.isOpened():
+            print("[Camera] Already open")
+            return
+        self.cap = cv2.VideoCapture(self.index)
+        if not self.cap.isOpened():
+            print("[Camera] ERROR: Failed to reopen camera!")
+            self.enabled = False
+            return
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print("[Camera] Reopened — light on")
+
+    def capture_frame(self):
+        """Return raw frame (for motion detection) and JPEG bytes."""
+        if not self.enabled:
+            return None, None
         ret, frame = self.cap.read()
         if not ret:
-            return None
+            return None, None
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        return jpeg.tobytes()
+        return frame, jpeg.tobytes()
 
     def close(self):
         self.cap.release()
@@ -100,20 +205,49 @@ class Microphone:
         self.stream = None
         self.buffer = []
         self.lock = threading.Lock()
+        self.enabled = True
+        self.last_callback_time = time.time()
+        self._health_thread = None
 
     def start(self):
-        self.stream = self.pa.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK,
-            stream_callback=self._callback
-        )
-        print("[Mic] Listening")
+        try:
+            if self.stream:
+                try:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                except:
+                    pass
+            self.stream = self.pa.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+                stream_callback=self._callback
+            )
+            self.last_callback_time = time.time()
+            print("[Mic] Listening")
+            # Start health monitor if not running
+            if not self._health_thread or not self._health_thread.is_alive():
+                self._health_thread = threading.Thread(target=self._health_monitor, daemon=True)
+                self._health_thread.start()
+        except Exception as e:
+            print(f"[Mic] ERROR starting stream: {e}")
+
+    def _health_monitor(self):
+        """Check every 10s that callbacks are still firing. Restart if dead."""
+        while True:
+            time.sleep(10)
+            if not self.enabled:
+                continue
+            elapsed = time.time() - self.last_callback_time
+            if elapsed > 5:
+                print(f"[Mic] ⚠️ Stream dead — no callback for {elapsed:.0f}s. Restarting...")
+                self.start()
 
     def _callback(self, data, frame_count, time_info, status):
-        if not is_speaking:
+        self.last_callback_time = time.time()
+        if not is_speaking and self.enabled:
             with self.lock:
                 self.buffer.append(data)
         return (None, pyaudio.paContinue)
@@ -136,47 +270,152 @@ class Microphone:
 class Speaker:
     def __init__(self):
         self.lock = threading.Lock()
+        self.queue = []
+        self.queue_lock = threading.Lock()
+        self._playing = False
+        self.use_pulse = False  # True = route through PulseAudio (for Bluetooth)
+        self._pacat_proc = None  # Persistent pacat process to avoid pop
+        self._aplay_proc = None  # Persistent aplay process to avoid pop
+        self._silence_thread = None
+        self._silence_stop = threading.Event()
+        self._last_audio_write = 0  # timestamp of last real audio write
+
+    def enqueue(self, audio_bytes, audio_format='mp3', text=''):
+        """Add audio to playback queue. Starts player thread if not running."""
+        with self.queue_lock:
+            self.queue.append((audio_bytes, audio_format, text))
+            if not self._playing:
+                self._playing = True
+                threading.Thread(target=self._play_queue, daemon=True).start()
+
+    def _play_queue(self):
+        """Play all queued audio sequentially, keeping is_speaking=True throughout."""
+        global is_speaking
+        is_speaking = True
+        try:
+            while True:
+                with self.queue_lock:
+                    if not self.queue:
+                        break
+                    audio_bytes, audio_format, text = self.queue.pop(0)
+                self._play_one(audio_bytes)
+        finally:
+            is_speaking = False
+            with self.queue_lock:
+                self._playing = False
+
+    def _start_bt_stream(self):
+        """Start persistent pacat with silence feeder to prevent BT pop."""
+        if self._pacat_proc and self._pacat_proc.poll() is None:
+            return  # Already running
+        self._silence_stop.clear()
+        self._pacat_proc = subprocess.Popen(
+            ['pacat', '--format=s16le', '--rate=24000', '--channels=1', '--playback', '--latency-msec=100'],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        # Feed silence in background to keep A2DP alive
+        def feed_silence():
+            # True silence — only feeds when no real audio is flowing
+            silence = b'\x00' * 4800  # 100ms of silence at 24kHz 16-bit mono
+            while not self._silence_stop.is_set():
+                try:
+                    now = time.time()
+                    # Only feed silence if no real audio in last 0.5s
+                    if self._pacat_proc and self._pacat_proc.poll() is None and (now - self._last_audio_write) > 0.5:
+                        with self.lock:
+                            self._pacat_proc.stdin.write(silence)
+                            self._pacat_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+                self._silence_stop.wait(0.1)
+        self._silence_thread = threading.Thread(target=feed_silence, daemon=True)
+        self._silence_thread.start()
+        print('[Speaker] BT stream started with silence feeder')
+
+    def _stop_bt_stream(self):
+        """Stop persistent pacat and silence feeder."""
+        self._silence_stop.set()
+        if self._pacat_proc and self._pacat_proc.poll() is None:
+            self._pacat_proc.terminate()
+        self._pacat_proc = None
+        print('[Speaker] BT stream stopped')
+
+    def _play_one(self, audio_bytes):
+        """Decode and play a single audio chunk."""
+        try:
+            vol_filter = f'volume={VOLUME / 100.0}'
+            proc = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-af', vol_filter, '-f', 'wav', '-acodec', 'pcm_s16le',
+                 '-ar', '24000', '-ac', '1', 'pipe:1'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            wav_data, _ = proc.communicate(input=audio_bytes, timeout=30)
+
+            if wav_data and len(wav_data) > 44:
+                pcm = wav_data[44:]
+                # Fade in first 15ms and fade out last 15ms to prevent pop
+                import struct
+                fade_samples = min(360, len(pcm) // 2)  # 15ms at 24kHz, 2 bytes per sample
+                arr = list(struct.unpack(f'<{len(pcm)//2}h', pcm))
+                for i in range(fade_samples):
+                    arr[i] = int(arr[i] * (i / fade_samples))
+                for i in range(fade_samples):
+                    arr[-(i+1)] = int(arr[-(i+1)] * (i / fade_samples))
+                pcm = struct.pack(f'<{len(arr)}h', *arr)
+                # Add 30ms silence pad at end
+                pcm += b'\x00' * 1440  # 30ms at 24kHz 16-bit mono
+                # Calculate playback duration for is_speaking timing
+                playback_secs = len(pcm) / (24000 * 2)  # 24kHz, 16-bit mono = 2 bytes/sample
+
+                if self.use_pulse:
+                    # Route through PulseAudio (Bluetooth speaker)
+                    if self._pacat_proc is None or self._pacat_proc.poll() is not None:
+                        self._start_bt_stream()
+                    try:
+                        with self.lock:
+                            self._last_audio_write = time.time()
+                            self._pacat_proc.stdin.write(pcm)
+                            self._pacat_proc.stdin.flush()
+                            self._last_audio_write = time.time()
+                    except (BrokenPipeError, OSError):
+                        self._start_bt_stream()
+                        with self.lock:
+                            self._last_audio_write = time.time()
+                            self._pacat_proc.stdin.write(pcm)
+                            self._pacat_proc.stdin.flush()
+                            self._last_audio_write = time.time()
+                else:
+                    # Direct ALSA (USB speaker) — persistent process
+                    if self._aplay_proc is None or self._aplay_proc.poll() is not None:
+                        self._aplay_proc = subprocess.Popen(
+                            ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                    try:
+                        self._aplay_proc.stdin.write(pcm)
+                        self._aplay_proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        self._aplay_proc = subprocess.Popen(
+                            ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                        self._aplay_proc.stdin.write(pcm)
+                        self._aplay_proc.stdin.flush()
+                # Wait for audio to actually play out before returning
+                time.sleep(playback_secs)
+        except subprocess.TimeoutExpired:
+            print("[Speaker] Timeout — killing audio")
+            subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[Speaker] Error: {e}")
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
-        global is_speaking
-
-        with self.lock:
-            is_speaking = True
-            try:
-                # Kill any stuck audio processes first
-                subprocess.run(['killall', '-q', 'aplay'], stderr=subprocess.DEVNULL)
-
-                # Decode with ffmpeg, apply volume filter
-                vol_filter = f'volume={VOLUME / 100.0}'
-                proc = subprocess.Popen(
-                    ['ffmpeg', '-i', 'pipe:0', '-af', vol_filter, '-f', 'wav', '-acodec', 'pcm_s16le',
-                     '-ar', '24000', '-ac', '1', 'pipe:1'],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                wav_data, _ = proc.communicate(input=audio_bytes, timeout=30)
-
-                if wav_data and len(wav_data) > 44:
-                    play = subprocess.Popen(
-                        ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
-                        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                    )
-                    play.communicate(input=wav_data[44:], timeout=60)
-            except subprocess.TimeoutExpired:
-                print("[Speaker] Timeout — killing audio")
-                try:
-                    proc.kill()
-                except:
-                    pass
-                subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"[Speaker] Error: {e}")
-            finally:
-                is_speaking = False
+        """Legacy non-queued playback."""
+        self.enqueue(audio_bytes, audio_format)
 
     def keep_alive(self):
         """Play silence to prevent audio device from sleeping."""
         try:
-            # 0.1s of silence at 24kHz 16-bit mono
             silence = b'\x00' * 4800
             proc = subprocess.Popen(
                 ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
@@ -191,14 +430,16 @@ class Speaker:
 
 
 async def run():
+    global last_motion_time, noise_start_time, sleep_state
+
     print(f"[Droid] Connecting to {SERVER}")
+    print(f"[Sleep] {'Enabled' if SLEEP_ENABLED else 'Disabled'} — idle:{IDLE_TIMEOUT}s, rms:{RMS_THRESHOLD}, debounce:{WAKE_DEBOUNCE}s")
 
     camera = Camera(CAMERA_INDEX)
     mic = Microphone()
     speaker = Speaker()
     mic.start()
 
-    # Initialize servo controller (safe to run without hardware)
     from servo import ServoController
     servos = ServoController()
 
@@ -216,12 +457,18 @@ async def run():
                 print("[Droid] Connected!")
                 connected = True
 
-                # Send device info
+                # Reset state on connect
+                sleep_state = 'awake'
+                last_motion_time = time.time()
+                noise_start_time = None
+
+                ws_send_queue = []
+
                 await ws.send(json.dumps({
                     'type': 'device_info',
                     'platform': 'raspberry_pi',
                     'model': 'Pi 3 Model B',
-                    'capabilities': ['camera', 'microphone', 'speaker']
+                    'capabilities': ['camera', 'microphone', 'speaker', 'sleep_wake']
                 }))
 
                 last_frame_time = 0
@@ -229,7 +476,11 @@ async def run():
 
                 while running and connected:
                     try:
-                        # Check for incoming messages (non-blocking, short timeout)
+                        # Send queued messages
+                        while ws_send_queue:
+                            await ws.send(ws_send_queue.pop(0))
+
+                        # Check for incoming messages
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=0.2)
                             msg = json.loads(raw)
@@ -242,11 +493,9 @@ async def run():
                                     text = msg.get('text', '')
                                     if text:
                                         print(f'[Droid] "{text}"')
-                                    threading.Thread(
-                                        target=speaker.play_audio,
-                                        args=(audio_bytes, msg.get('format', 'mp3')),
-                                        daemon=True
-                                    ).start()
+                                    # Speaking = activity
+                                    last_motion_time = time.time()
+                                    speaker.enqueue(audio_bytes, msg.get('format', 'mp3'), text)
 
                             elif msg_type == 'text':
                                 print(f"[Droid] {msg.get('text', '')}")
@@ -259,48 +508,284 @@ async def run():
 
                             elif msg_type == 'volume':
                                 global VOLUME
-                                VOLUME = max(0, min(100, msg.get('level', 80)))
-                                print(f"[Volume] Set to {VOLUME}%")
+                                VOLUME = max(0, min(1000, msg.get('volume', msg.get('level', 80))))
+                                print(f"[Volume] Set to {VOLUME}")
 
                             elif msg_type == 'servo':
                                 pan = msg.get('pan', 90)
                                 tilt = msg.get('tilt', 90)
                                 servos.look_at(pan, tilt)
 
+                            elif msg_type == 'wake':
+                                do_wake('server', ws_send_queue)
+
+                            elif msg_type == 'camera_off':
+                                camera.disable()
+                                print('[Droid] Camera OFF')
+
+                            elif msg_type == 'camera_on':
+                                camera.enable()
+                                print('[Droid] Camera ON')
+
+                            elif msg_type == 'bluetooth_on':
+                                import subprocess as sp
+                                import time as _time
+                                BT_MAC = '49:ED:E8:CC:23:3D'
+                                def bt_connect():
+                                    def run(cmd):
+                                        r = sp.run(cmd, capture_output=True, text=True, timeout=15)
+                                        print(f'[BT] {" ".join(cmd)} → {r.stdout.strip()} {r.stderr.strip()}')
+                                        return r
+                                    run(['bluetoothctl', 'power', 'on'])
+                                    # Try connecting first — works if already paired
+                                    r = run(['bluetoothctl', 'connect', BT_MAC])
+                                    if 'successful' in r.stdout.lower():
+                                        _time.sleep(2)
+                                        r = run(['pactl', 'list', 'sinks', 'short'])
+                                        for line in r.stdout.split('\n'):
+                                            if 'bluez' in line:
+                                                sink = line.split('\t')[1] if '\t' in line else line.split()[1]
+                                                run(['pactl', 'set-default-sink', sink])
+                                                return sink
+                                    # If connect failed, do full cycle
+                                    run(['bluetoothctl', 'remove', BT_MAC])
+                                    _time.sleep(1)
+                                    run(['bluetoothctl', '--timeout', '12', 'scan', 'on'])
+                                    # Check if found
+                                    r = run(['bluetoothctl', 'devices'])
+                                    if BT_MAC not in r.stdout:
+                                        return None
+                                    run(['bluetoothctl', 'pair', BT_MAC])
+                                    _time.sleep(1)
+                                    run(['bluetoothctl', 'trust', BT_MAC])
+                                    _time.sleep(1)
+                                    run(['bluetoothctl', 'connect', BT_MAC])
+                                    _time.sleep(3)
+                                    r = run(['pactl', 'list', 'sinks', 'short'])
+                                    for line in r.stdout.split('\n'):
+                                        if 'bluez' in line:
+                                            sink = line.split('\t')[1] if '\t' in line else line.split()[1]
+                                            run(['pactl', 'set-default-sink', sink])
+                                            return sink
+                                    return None
+                                async def do_bt_on():
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        sink = await loop.run_in_executor(None, bt_connect)
+                                        if sink:
+                                            print(f'[Droid] Bluetooth connected: {sink}')
+                                            speaker.use_pulse = True
+                                            speaker._start_bt_stream()
+                                        else:
+                                            print('[Droid] Bluetooth failed — staying on USB')
+                                    except Exception as e:
+                                        print(f'[Droid] Bluetooth error: {e}')
+                                asyncio.ensure_future(do_bt_on())
+
+                            elif msg_type == 'bluetooth_off':
+                                # Switch back to USB speaker
+                                import subprocess
+                                try:
+                                    # Kill persistent pacat + silence feeder
+                                    speaker._stop_bt_stream()
+                                    subprocess.run(['bash', '-c', '''
+                                        USB_SINK=$(pactl list sinks short | grep -i uac | awk '{print $2}')
+                                        if [ -n "$USB_SINK" ]; then
+                                            pactl set-default-sink "$USB_SINK"
+                                        fi
+                                    '''], capture_output=True, text=True, timeout=5)
+                                    speaker.use_pulse = False
+                                    print('[Droid] Switched to USB speaker')
+                                except Exception as e:
+                                    print(f'[Droid] Speaker switch error: {e}')
+
+                            elif msg_type == 'mic_off':
+                                mic.enabled = False
+                                print('[Droid] Mic OFF')
+
+                            elif msg_type == 'mic_on':
+                                mic.enabled = True
+                                mic.start()  # Restart stream in case it died
+                                print('[Droid] Mic ON')
+
+                            elif msg_type == 'wifi_scan':
+                                import subprocess as sp, re
+                                try:
+                                    # Use iwlist for comprehensive scan, nmcli misses some networks
+                                    result = sp.run(['sudo', 'iwlist', 'wlan0', 'scan'],
+                                                   capture_output=True, text=True, timeout=30)
+                                    networks = []
+                                    seen = set()
+                                    current = {}
+                                    for line in result.stdout.split('\n'):
+                                        line = line.strip()
+                                        if 'ESSID:' in line:
+                                            m = re.search(r'ESSID:"(.+)"', line)
+                                            if m:
+                                                current['ssid'] = m.group(1)
+                                        elif 'Quality=' in line:
+                                            m = re.search(r'Quality=(\d+)/(\d+)', line)
+                                            if m:
+                                                current['signal'] = int(100 * int(m.group(1)) / int(m.group(2)))
+                                        elif 'Encryption key:' in line:
+                                            current['security'] = 'WPA' if 'on' in line else 'Open'
+                                        elif line.startswith('Cell ') and current.get('ssid'):
+                                            if current['ssid'] not in seen:
+                                                seen.add(current['ssid'])
+                                                networks.append(current)
+                                            current = {}
+                                    # Don't forget last cell
+                                    if current.get('ssid') and current['ssid'] not in seen:
+                                        seen.add(current['ssid'])
+                                        networks.append(current)
+                                    networks.sort(key=lambda x: x.get('signal', 0), reverse=True)
+                                    await ws.send(json.dumps({'type': 'wifi_scan_result', 'networks': networks}))
+                                except Exception as e:
+                                    await ws.send(json.dumps({'type': 'wifi_scan_result', 'networks': [], 'error': str(e)}))
+
+                            elif msg_type == 'wifi_connect':
+                                import subprocess as sp
+                                ssid = msg.get('ssid', '')
+                                pw = msg.get('password', '')
+                                try:
+                                    result = sp.run(['nmcli', 'device', 'wifi', 'connect', ssid, 'password', pw, 'ifname', 'wlan0'],
+                                                   capture_output=True, text=True, timeout=30)
+                                    success = result.returncode == 0
+                                    if success:
+                                        sp.run(['nmcli', 'connection', 'modify', ssid, 'connection.autoconnect', 'yes', 'connection.autoconnect-retries', '0'],
+                                              capture_output=True, timeout=5)
+                                    await ws.send(json.dumps({'type': 'wifi_connect_result', 'success': success, 'ssid': ssid,
+                                                             'error': '' if success else result.stderr.strip() or result.stdout.strip()}))
+                                except Exception as e:
+                                    await ws.send(json.dumps({'type': 'wifi_connect_result', 'success': False, 'error': str(e)}))
+
+                            elif msg_type == 'bt_scan':
+                                import subprocess as sp
+                                def bt_scan_sync():
+                                    sp.run(['bluetoothctl', 'power', 'on'], capture_output=True, timeout=5)
+                                    sp.run(['bluetoothctl', '--timeout', '8', 'scan', 'on'], capture_output=True, timeout=12)
+                                    result = sp.run(['bluetoothctl', 'devices'], capture_output=True, text=True, timeout=5)
+                                    bt_devices = []
+                                    for line in result.stdout.strip().split('\n'):
+                                        parts = line.split(' ', 2)
+                                        if len(parts) >= 3:
+                                            bt_devices.append({'address': parts[1], 'name': parts[2]})
+                                    paired = sp.run(['bluetoothctl', 'devices', 'Paired'], capture_output=True, text=True, timeout=5)
+                                    paired_addrs = set()
+                                    for line in paired.stdout.strip().split('\n'):
+                                        parts = line.split(' ', 2)
+                                        if len(parts) >= 2:
+                                            paired_addrs.add(parts[1])
+                                    for d in bt_devices:
+                                        d['paired'] = d['address'] in paired_addrs
+                                    return bt_devices
+                                async def do_bt_scan():
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        devs = await loop.run_in_executor(None, bt_scan_sync)
+                                        await ws.send(json.dumps({'type': 'bt_scan_result', 'devices': devs}))
+                                    except Exception as e:
+                                        await ws.send(json.dumps({'type': 'bt_scan_result', 'devices': [], 'error': str(e)}))
+                                asyncio.ensure_future(do_bt_scan())
+
+                            elif msg_type == 'bt_pair':
+                                import subprocess as sp
+                                addr = msg.get('address', '')
+                                def bt_pair_sync(address):
+                                    r1 = sp.run(['bluetoothctl', 'pair', address], capture_output=True, text=True, timeout=15)
+                                    r2 = sp.run(['bluetoothctl', 'trust', address], capture_output=True, text=True, timeout=5)
+                                    r3 = sp.run(['bluetoothctl', 'connect', address], capture_output=True, text=True, timeout=10)
+                                    return 'successful' in r3.stdout.lower() or 'successful' in r1.stdout.lower()
+                                async def do_bt_pair():
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        success = await loop.run_in_executor(None, bt_pair_sync, addr)
+                                        await ws.send(json.dumps({'type': 'bt_pair_result', 'success': success, 'address': addr}))
+                                    except Exception as e:
+                                        await ws.send(json.dumps({'type': 'bt_pair_result', 'success': False, 'error': str(e)}))
+                                asyncio.ensure_future(do_bt_pair())
+
+                            elif msg_type == 'ap_config':
+                                # Save AP config for wifi-manager
+                                ap_ssid = msg.get('ssid', 'Droid-Setup')
+                                ap_pw = msg.get('password', 'droid1234')
+                                try:
+                                    ap_conf = {'ssid': ap_ssid, 'password': ap_pw}
+                                    with open('/home/mrcdcox/droid/ap-config.json', 'w') as f:
+                                        json.dump(ap_conf, f)
+                                    await ws.send(json.dumps({'type': 'ap_config_result', 'success': True}))
+                                    print(f'[Droid] AP config saved: {ap_ssid}')
+                                except Exception as e:
+                                    await ws.send(json.dumps({'type': 'ap_config_result', 'success': False, 'error': str(e)}))
+
                             elif msg_type == 'ping':
                                 await ws.send(json.dumps({'type': 'pong'}))
 
                         except asyncio.TimeoutError:
-                            pass  # No message, that's fine
+                            pass
 
-                        # Send camera frame if interval elapsed
                         now = time.time()
-                        if now - last_frame_time >= FRAME_INTERVAL:
-                            jpeg = camera.capture_jpeg()
-                            if jpeg:
+
+                        if sleep_state == 'awake':
+                            # === AWAKE MODE ===
+
+                            # Send camera frame + check motion
+                            if now - last_frame_time >= FRAME_INTERVAL:
+                                frame, jpeg = camera.capture_frame()
+                                if jpeg:
+                                    # Check for motion
+                                    if frame is not None and SLEEP_ENABLED:
+                                        if detect_motion(frame):
+                                            last_motion_time = now
+
+                                    await ws.send(json.dumps({
+                                        'type': 'frame',
+                                        'data': base64.b64encode(jpeg).decode('ascii'),
+                                        'timestamp': now
+                                    }))
+                                    last_frame_time = now
+
+                            # Send audio to server for STT
+                            audio = mic.get_audio()
+                            if audio:
+                                # Audio activity also resets idle (if loud enough)
+                                rms = compute_rms(audio)
+                                if rms > RMS_THRESHOLD:
+                                    last_motion_time = now
+
                                 await ws.send(json.dumps({
-                                    'type': 'frame',
-                                    'data': base64.b64encode(jpeg).decode('ascii'),
-                                    'timestamp': now
+                                    'type': 'audio',
+                                    'data': base64.b64encode(audio).decode('ascii'),
+                                    'sample_rate': SAMPLE_RATE,
+                                    'channels': CHANNELS,
+                                    'format': 'pcm_s16le'
                                 }))
-                                last_frame_time = now
+
+                            # Check idle timeout → sleep
+                            if SLEEP_ENABLED and (now - last_motion_time) > IDLE_TIMEOUT:
+                                do_sleep(ws_send_queue)
+
+                        else:
+                            # === SLEEPING MODE ===
+                            # Don't send camera frames or audio to server
+                            # Just listen for noise to wake up
+
+                            audio = mic.get_audio()
+                            if audio:
+                                rms = compute_rms(audio)
+                                if rms > RMS_THRESHOLD:
+                                    if noise_start_time is None:
+                                        noise_start_time = now
+                                    elif now - noise_start_time >= WAKE_DEBOUNCE:
+                                        do_wake('noise', ws_send_queue)
+                                else:
+                                    noise_start_time = None
 
                         # Keep audio device alive (every 10s)
                         if now - last_keepalive > 10:
                             last_keepalive = now
                             if not is_speaking:
                                 threading.Thread(target=speaker.keep_alive, daemon=True).start()
-
-                        # Send buffered audio
-                        audio = mic.get_audio()
-                        if audio:
-                            await ws.send(json.dumps({
-                                'type': 'audio',
-                                'data': base64.b64encode(audio).decode('ascii'),
-                                'sample_rate': SAMPLE_RATE,
-                                'channels': CHANNELS,
-                                'format': 'pcm_s16le'
-                            }))
 
                     except websockets.ConnectionClosed:
                         connected = False
@@ -324,5 +809,6 @@ if __name__ == '__main__':
     print("=" * 40)
     print("  DROID Pi Client")
     print("  Camera + Mic -> Server -> Speaker")
+    print("  Sleep/Wake: motion + noise detection")
     print("=" * 40)
     asyncio.run(run())
