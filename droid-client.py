@@ -22,6 +22,8 @@ import subprocess
 import struct
 import math
 
+CLIENT_VERSION = '1.0.0'
+
 try:
     import cv2
 except ImportError:
@@ -993,6 +995,7 @@ async def run():
                     'type': 'device_info',
                     'platform': 'raspberry_pi',
                     'model': 'Pi 3 Model B',
+                    'version': CLIENT_VERSION,
                     'capabilities': ['camera', 'microphone', 'speaker', 'sleep_wake']
                 }))
 
@@ -1298,6 +1301,55 @@ async def run():
 
                             elif msg_type == 'ping':
                                 await ws.send(json.dumps({'type': 'pong'}))
+
+                            elif msg_type == 'ota_update':
+                                # OTA update — git pull and restart
+                                print('[OTA] Update requested by server')
+                                try:
+                                    import subprocess as sp_ota
+                                    work_dir = os.path.dirname(os.path.abspath(__file__))
+                                    
+                                    # Git pull
+                                    result = sp_ota.run(
+                                        ['git', 'pull', 'origin', 'main'],
+                                        capture_output=True, text=True, timeout=60,
+                                        cwd=work_dir
+                                    )
+                                    pull_output = result.stdout.strip() + result.stderr.strip()
+                                    print(f'[OTA] git pull: {pull_output}')
+                                    
+                                    if 'Already up to date' in pull_output:
+                                        await ws.send(json.dumps({
+                                            'type': 'ota_result',
+                                            'success': True,
+                                            'message': 'Already up to date',
+                                            'version': CLIENT_VERSION
+                                        }))
+                                    else:
+                                        await ws.send(json.dumps({
+                                            'type': 'ota_result',
+                                            'success': True,
+                                            'message': 'Updated. Restarting...',
+                                            'output': pull_output[:500]
+                                        }))
+                                        # Restart the service
+                                        print('[OTA] Restarting droid service...')
+                                        sp_ota.Popen(['sudo', 'systemctl', 'restart', 'droid'],
+                                                     stdout=sp_ota.DEVNULL, stderr=sp_ota.DEVNULL)
+                                except Exception as ota_err:
+                                    print(f'[OTA] Error: {ota_err}')
+                                    await ws.send(json.dumps({
+                                        'type': 'ota_result',
+                                        'success': False,
+                                        'message': str(ota_err)
+                                    }))
+
+                            elif msg_type == 'ota_version':
+                                # Report current version
+                                await ws.send(json.dumps({
+                                    'type': 'ota_version_result',
+                                    'version': CLIENT_VERSION
+                                }))
 
                         except asyncio.TimeoutError:
                             pass
