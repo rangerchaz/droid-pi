@@ -1,6 +1,5 @@
 {
-  "server": "wss://droid.turkeycode.ai/ws/device",
-  "token": "",
+  "token": "paste-your-device-token-here",
   "camera_index": 0,
   "volume": 250,
   "idle_timeout": 60,

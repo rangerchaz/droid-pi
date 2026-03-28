@@ -51,7 +51,7 @@ with open(CONFIG_PATH) as f:
     config = json.load(f)
 
 # User config
-SERVER = config.get('server', 'wss://droid.turkeycode.ai/ws/device')
+SERVER = 'wss://droid.turkeycode.ai/ws/device'
 TOKEN = config.get('token', '')
 CAMERA_INDEX = config.get('camera_index', 0)
 VOLUME = config.get('volume', 250)
