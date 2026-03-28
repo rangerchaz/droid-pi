@@ -71,7 +71,8 @@ WAKE_DEBOUNCE = config.get('wake_debounce', 0.5)         # seconds of noise to w
 SLEEP_ENABLED = config.get('sleep_enabled', True)
 
 # Audio config
-CHANNELS = 1
+CHANNELS = 1       # Output channels (server expects mono)
+MIC_CHANNELS = 1   # Capture mono (simpler, no downmix needed)
 FORMAT = pyaudio.paInt16
 CHUNK = int(SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
 
@@ -79,6 +80,7 @@ CHUNK = int(SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
 running = True
 is_speaking = False
 sleep_state = 'awake'  # 'awake' | 'sleeping'
+boot_time = time.time()  # Don't auto-sleep for first 120s after boot
 last_motion_time = time.time()
 noise_start_time = None
 prev_frame_gray = None
@@ -141,6 +143,8 @@ def do_sleep(ws_send_queue):
         return
     sleep_state = 'sleeping'
     camera.disable()
+    servo_controller.center()  # Look forward when sleeping
+    motion_tracker.prev_gray = None  # Reset so wake doesn't trigger false motion
     print("[Sleep] 💤 Sleeping — no activity for", IDLE_TIMEOUT, "seconds")
     ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'sleeping'}))
 
@@ -170,7 +174,21 @@ class Camera:
     def _open(self):
         """Try to open camera. Don't crash if it fails — retry later."""
         try:
-            self.cap = cv2.VideoCapture(self.index)
+            # Auto-detect Brio by trying configured index, then scanning
+            for idx in [self.index, 0, 1, 2]:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    self.cap = cap
+                    if idx != self.index:
+                        print(f"[Camera] Found camera at index {idx} (configured: {self.index})")
+                        self.index = idx
+                    break
+                cap.release()
+            else:
+                print(f"[Camera] WARNING: Cannot open any camera — will retry")
+                self.cap = None
+                self.enabled = False
+                return False
             if not self.cap.isOpened():
                 print(f"[Camera] WARNING: Cannot open camera {self.index} — will retry")
                 self.cap = None
@@ -215,15 +233,183 @@ class Camera:
         self.cap.release()
 
 
+# --- Face tracker (Haar cascade, runs on Pi, no API cost) ---
+class FaceTracker:
+    def __init__(self):
+        # Find haar cascade — try cv2.data, then local copy
+        cascade_path = None
+        try:
+            p = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if os.path.exists(p):
+                cascade_path = p
+        except (AttributeError, TypeError):
+            pass
+        if not cascade_path:
+            # Local copy next to script
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'haarcascade_frontalface_default.xml')
+            if os.path.exists(p):
+                cascade_path = p
+        if not cascade_path:
+            # Working directory
+            p = os.path.join(os.getcwd(), 'haarcascade_frontalface_default.xml')
+            if os.path.exists(p):
+                cascade_path = p
+        if cascade_path:
+            print(f'[FaceTracker] Cascade: {cascade_path}')
+        else:
+            print('[FaceTracker] WARNING: No cascade file found — face tracking disabled')
+        self.cascade = cv2.CascadeClassifier(cascade_path or '')
+        self.last_face = None  # (x, y, w, h) of last detected face
+        self.frames_without_face = 0
+        self._enabled = True
+        print("[FaceTracker] Initialized")
+
+    def detect(self, frame):
+        """Detect largest face in frame. Returns (center_x, center_y, w, h) or None."""
+        if not self._enabled:
+            return None
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Histogram equalization — critical for low-light face detection
+            gray = cv2.equalizeHist(gray)
+            # Scale down for speed on Pi 3B
+            small = cv2.resize(gray, (320, 240))
+            scale_x = frame.shape[1] / 320
+            scale_y = frame.shape[0] / 240
+            faces = self.cascade.detectMultiScale(small, 1.1, 3, minSize=(20, 20))
+            if self.frames_without_face % 30 == 0 and self.frames_without_face > 0:
+                print(f'[FaceTracker] No face for {self.frames_without_face} frames')
+            if len(faces) > 0:
+                if self.frames_without_face > 5:
+                    print(f'[FaceTracker] Found face! ({len(faces)} detected)')
+                # Largest face
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                # Scale back to original resolution
+                cx = int((x + w / 2) * scale_x)
+                cy = int((y + h / 2) * scale_y)
+                self.last_face = (cx, cy, int(w * scale_x), int(h * scale_y))
+                self.frames_without_face = 0
+                return self.last_face
+            else:
+                self.frames_without_face += 1
+                return None
+        except Exception as e:
+            return None
+
+
+class MotionTracker:
+    """Track motion centroid via frame differencing — works in any lighting."""
+    def __init__(self):
+        self.prev_gray = None
+        self.last_centroid = None  # (cx, cy) of motion center
+        self.frames_without_motion = 0
+
+    def detect(self, frame):
+        """Returns (center_x, center_y) of motion, or None."""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            small = cv2.resize(gray, (160, 120))
+
+            if self.prev_gray is None:
+                self.prev_gray = small
+                return None
+
+            # Frame difference
+            diff = cv2.absdiff(self.prev_gray, small)
+            self.prev_gray = small
+
+            # Threshold — pixels that changed significantly
+            _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+
+            # Find contours of motion regions
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                self.frames_without_motion += 1
+                return None
+
+            # Filter small noise (< 3% of frame area)
+            min_area = (160 * 120) * 0.03
+            big_contours = [c for c in contours if cv2.contourArea(c) > min_area]
+
+            if not big_contours:
+                self.frames_without_motion += 1
+                return None
+
+            # Largest motion region
+            largest = max(big_contours, key=cv2.contourArea)
+            M = cv2.moments(largest)
+            if M['m00'] == 0:
+                return None
+
+            # Scale back to original frame coords
+            scale_x = frame.shape[1] / 160
+            scale_y = frame.shape[0] / 120
+            cx = int((M['m10'] / M['m00']) * scale_x)
+            cy = int((M['m01'] / M['m00']) * scale_y)
+
+            self.last_centroid = (cx, cy)
+            self.frames_without_motion = 0
+            return (cx, cy)
+        except Exception:
+            return None
+
+
 class Microphone:
     def __init__(self):
-        self.pa = pyaudio.PyAudio()
+        # Retry PyAudio init — ALSA devices may not be ready immediately
+        for attempt in range(10):
+            self.pa = pyaudio.PyAudio()
+            self._device_index = self._find_capture_device()
+            if self._device_index is not None:
+                break
+            print(f'[Mic] No capture device found, retrying in 3s... ({attempt+1}/10)')
+            self.pa.terminate()
+            time.sleep(3)
         self.stream = None
         self.buffer = []
         self.lock = threading.Lock()
         self.enabled = True
         self.last_callback_time = time.time()
         self._health_thread = None
+
+    def _find_capture_device(self):
+        """Find the USB webcam mic — try all PyAudio devices with input channels."""
+        import re
+        # Find ALSA card number from /proc/asound/cards
+        try:
+            with open('/proc/asound/cards') as f:
+                for line in f:
+                    m = re.match(r'^\s*(\d+)\s+\[(\w+)', line)
+                    if m and any(k in line.lower() for k in ['logitech', 'brio', '046d', 'c260', 'c270', '0x46d', 'usb device 0x46d']):
+                        card_num = int(m.group(1))
+                        card_name = m.group(2)
+                        print(f'[Mic] Found ALSA card {card_num}: {card_name}')
+                        # Search all PyAudio devices for this card
+                        for i in range(self.pa.get_device_count()):
+                            try:
+                                d = self.pa.get_device_info_by_index(i)
+                                if d['maxInputChannels'] > 0:
+                                    name = d.get('name', '')
+                                    if f'hw:{card_num}' in name or card_name.lower() in name.lower():
+                                        print(f'[Mic] Using device {i}: {name}')
+                                        return i
+                            except:
+                                continue
+                        # No hw match — try any non-PulseAudio device with input channels
+                        for i in range(self.pa.get_device_count()):
+                            try:
+                                d = self.pa.get_device_info_by_index(i)
+                                if d['maxInputChannels'] > 0 and 'pulse' not in d.get('name', '').lower():
+                                    print(f'[Mic] Fallback device {i}: {d["name"]}')
+                                    return i
+                            except:
+                                continue
+        except Exception as e:
+            print(f'[Mic] Card scan error: {e}')
+        print('[Mic] WARNING: No mic found, using default')
+        return None
 
     def start(self):
         try:
@@ -233,37 +419,84 @@ class Microphone:
                     self.stream.close()
                 except:
                     pass
-            self.stream = self.pa.open(
+            kwargs = dict(
                 format=FORMAT,
-                channels=CHANNELS,
+                channels=MIC_CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
                 frames_per_buffer=CHUNK,
                 stream_callback=self._callback
             )
+            if self._device_index is not None:
+                kwargs['input_device_index'] = self._device_index
+            self.stream = self.pa.open(**kwargs)
             self.last_callback_time = time.time()
-            print("[Mic] Listening")
+            self._actual_channels = MIC_CHANNELS
+            print(f"[Mic] Listening (stereo={MIC_CHANNELS==2})")
             # Start health monitor if not running
             if not self._health_thread or not self._health_thread.is_alive():
                 self._health_thread = threading.Thread(target=self._health_monitor, daemon=True)
                 self._health_thread.start()
         except Exception as e:
             print(f"[Mic] ERROR starting stream: {e}")
+            # Retry with mono if stereo failed
+            if MIC_CHANNELS == 2:
+                try:
+                    kwargs['channels'] = 1
+                    self.stream = self.pa.open(**kwargs)
+                    self.last_callback_time = time.time()
+                    self._actual_channels = 1
+                    print("[Mic] Listening (mono fallback)")
+                except Exception as e2:
+                    print(f"[Mic] ERROR mono fallback: {e2}")
+            # Always start health monitor — it will retry if stream dies or never opened
+            if not self._health_thread or not self._health_thread.is_alive():
+                if not self.stream:
+                    self.last_callback_time = time.time() - 20  # Force rebuild on first check
+                self._health_thread = threading.Thread(target=self._health_monitor, daemon=True)
+                self._health_thread.start()
 
     def _health_monitor(self):
-        """Check every 10s that callbacks are still firing. Restart if dead."""
+        """Check every 10s that callbacks are still firing. Full rebuild if dead."""
         while True:
             time.sleep(10)
             if not self.enabled:
                 continue
             elapsed = time.time() - self.last_callback_time
             if elapsed > 5:
-                print(f"[Mic] ⚠️ Stream dead — no callback for {elapsed:.0f}s. Restarting...")
+                print(f"[Mic] ⚠️ Stream dead — no callback for {elapsed:.0f}s. Full rebuild...")
+                try:
+                    if self.stream:
+                        try: self.stream.stop_stream()
+                        except: pass
+                        try: self.stream.close()
+                        except: pass
+                        self.stream = None
+                    self.pa.terminate()
+                except: pass
+                time.sleep(1)
+                # Full PyAudio rebuild + device re-enumeration
+                self.pa = pyaudio.PyAudio()
+                self._device_index = self._find_capture_device()
                 self.start()
+                if self.stream:
+                    print("[Mic] ✅ Stream rebuilt successfully")
+                else:
+                    print("[Mic] ❌ Rebuild failed — will retry in 10s")
 
     def _callback(self, data, frame_count, time_info, status):
         self.last_callback_time = time.time()
-        if not is_speaking and self.enabled:
+        if not self.enabled:
+            return (None, pyaudio.paContinue)  # Keep stream alive, discard data
+        if not is_speaking:
+            # Downmix stereo to mono — average both channels
+            if getattr(self, '_actual_channels', MIC_CHANNELS) == 2:
+                import array
+                samples = array.array('h', data)
+                left = samples[0::2]
+                right = samples[1::2]
+                mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
+                data = mono.tobytes()
             with self.lock:
                 self.buffer.append(data)
         return (None, pyaudio.paContinue)
@@ -283,7 +516,115 @@ class Microphone:
         self.pa.terminate()
 
 
+class MusicPlayer:
+    """Plays YouTube audio via yt-dlp + mpv. Wake-word only during playback."""
+    def __init__(self):
+        self.process = None
+        self.playing = False
+        self.title = None
+        self.volume = 120  # Moderate volume, high-pass filter handles bass distortion
+
+    def play(self, url, title='Unknown', ws_send_queue=None):
+        self.stop()
+        self.title = title
+        self.playing = True
+        self._ws_send_queue = ws_send_queue
+        try:
+            # mpv with yt-dlp backend, audio only — route to same output as TTS
+            self._ipc_path = '/tmp/mpv-droid-ipc'
+            # Get audio output from speaker singleton (global)
+            try:
+                spk = globals().get('speaker')
+                audio_out = spk.audio_output if spk else Speaker.OUTPUT_EXTERNAL
+            except Exception:
+                audio_out = Speaker.OUTPUT_EXTERNAL
+            if audio_out == Speaker.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
+                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:Audio']
+            elif audio_out == Speaker.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
+                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:UACDemoV10']
+            elif audio_out == Speaker.OUTPUT_BT:
+                ao_args = ['--ao=pulse']
+            elif os.path.exists('/proc/asound/Audio'):
+                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:Audio']
+            else:
+                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:UACDemoV10']
+            # High-pass filter to reduce bass distortion on small speakers
+            af_args = ['--af=lavfi=[highpass=f=80]']
+            self.process = subprocess.Popen(
+                ['mpv', '--no-video', '--really-quiet'] + ao_args + af_args + [
+                 '--volume=' + str(self.volume),
+                 '--ytdl-format=bestaudio',
+                 '--input-ipc-server=' + self._ipc_path,
+                 url],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            # Monitor for exit in background — notify server to play next
+            def _wait():
+                self.process.wait()
+                was_playing = self.playing
+                self.playing = False
+                self.title = None
+                print('[Music] Playback finished')
+                if was_playing and self._ws_send_queue is not None:
+                    self._ws_send_queue.append(json.dumps({'type': 'music_finished'}))
+            threading.Thread(target=_wait, daemon=True).start()
+        except FileNotFoundError:
+            print('[Music] ERROR: mpv not installed. Run: sudo apt install mpv yt-dlp')
+            self.playing = False
+        except Exception as e:
+            print(f'[Music] ERROR: {e}')
+            self.playing = False
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except:
+                self.process.kill()
+        self.process = None
+        self.playing = False
+        self.title = None
+
+    def toggle_pause(self):
+        if self.process and self.process.poll() is None:
+            try:
+                import socket
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(self._ipc_path)
+                sock.send(b'{"command": ["cycle", "pause"]}\n')
+                sock.close()
+            except Exception as e:
+                print(f'[Music] Pause toggle failed: {e}')
+
+    def set_volume(self, level):
+        self.volume = max(0, min(300, level * 3))  # Scale 0-100 user → 0-300 mpv
+        # Send to running mpv via IPC socket
+        if self.process and self.process.poll() is None:
+            try:
+                import socket
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(self._ipc_path)
+                cmd = '{"command": ["set_property", "volume", ' + str(self.volume) + ']}\n'
+                sock.send(cmd.encode())
+                sock.close()
+                print(f'[Music] Volume set to {self.volume} (live)')
+            except Exception as e:
+                print(f'[Music] Volume set to {self.volume} (applies on next play): {e}')
+        else:
+            print(f'[Music] Volume set to {self.volume} (applies on next play)')
+
+music_player = MusicPlayer()
+
 class Speaker:
+    # Audio output targets
+    OUTPUT_INTERNAL = 'internal'    # Small USB speaker (UACDemoV10)
+    OUTPUT_EXTERNAL = 'external'    # USB DAC dongle (KT USB Audio) → aux → X-GO
+    OUTPUT_BT = 'bluetooth'         # Bluetooth A2DP
+    # Legacy aliases
+    OUTPUT_USB = 'internal'
+    OUTPUT_HEADPHONE = 'external'
+
     def __init__(self):
         self.lock = threading.Lock()
         self.queue = []
@@ -292,31 +633,69 @@ class Speaker:
         self.use_pulse = False  # True = route through PulseAudio (for Bluetooth)
         self._pacat_proc = None  # Persistent pacat process to avoid pop
         self._aplay_proc = None  # Persistent aplay process to avoid pop
+        # Default: internal USB speaker, switch to external via voice command
+        if os.path.exists('/proc/asound/UACDemoV10'):
+            self.audio_output = self.OUTPUT_INTERNAL
+        elif os.path.exists('/proc/asound/Audio'):
+            self.audio_output = self.OUTPUT_EXTERNAL
+        else:
+            self.audio_output = self.OUTPUT_INTERNAL
         self._silence_thread = None
         self._silence_stop = threading.Event()
         self._last_audio_write = 0  # timestamp of last real audio write
+        self._mic_ref = None  # Set after mic is created, for echo flush
+        self._ws_send_queue = None  # Set to ws_send_queue for playback_done signal
 
-    def enqueue(self, audio_bytes, audio_format='mp3', text=''):
+    def _flush_mic(self):
+        """Flush buffered mic data to prevent echo from being processed."""
+        try:
+            if self._mic_ref and self._mic_ref.stream and self._mic_ref.stream.is_active():
+                avail = self._mic_ref.stream.get_read_available()
+                if avail > 0:
+                    self._mic_ref.stream.read(avail, exception_on_overflow=False)
+        except Exception:
+            pass
+
+    def enqueue(self, audio_bytes, audio_format='mp3', text='', rate=24000, channels=1):
         """Add audio to playback queue. Starts player thread if not running."""
         with self.queue_lock:
-            self.queue.append((audio_bytes, audio_format, text))
+            self.queue.append((audio_bytes, audio_format, text, rate, channels))
             if not self._playing:
                 self._playing = True
                 threading.Thread(target=self._play_queue, daemon=True).start()
+
+    def interrupt(self):
+        """Stop current playback and clear queue."""
+        with self.queue_lock:
+            self.queue.clear()
+        self._interrupted = True
+        # Kill any active aplay
+        if hasattr(self, '_active_aplay') and self._active_aplay and self._active_aplay.poll() is None:
+            self._active_aplay.kill()
 
     def _play_queue(self):
         """Play all queued audio sequentially, keeping is_speaking=True throughout."""
         global is_speaking
         is_speaking = True
+        self._interrupted = False
         try:
-            while True:
+            while not self._interrupted:
                 with self.queue_lock:
                     if not self.queue:
                         break
-                    audio_bytes, audio_format, text = self.queue.pop(0)
-                self._play_one(audio_bytes)
+                    audio_bytes, audio_format, text, rate, channels = self.queue.pop(0)
+                if audio_format == 'pcm':
+                    self._play_pcm(audio_bytes, rate, channels)
+                else:
+                    self._play_one(audio_bytes)
         finally:
+            time.sleep(0.3)
+            # Flush any buffered mic data that captured our own speech
+            self._flush_mic()
             is_speaking = False
+            # Notify server that playback is actually done
+            if self._ws_send_queue is not None:
+                self._ws_send_queue.append(json.dumps({'type': 'playback_done'}))
             with self.queue_lock:
                 self._playing = False
 
@@ -356,10 +735,69 @@ class Speaker:
         self._pacat_proc = None
         print('[Speaker] BT stream stopped')
 
+    def _play_pcm(self, pcm_bytes, rate=24000, channels=1):
+        """Play raw PCM directly — no ffmpeg decode needed."""
+        try:
+            if self._interrupted:
+                return
+            # Apply volume
+            vol = VOLUME / 100.0
+            if vol != 1.0:
+                import array
+                samples = array.array('h', pcm_bytes)
+                for i in range(len(samples)):
+                    samples[i] = max(-32768, min(32767, int(samples[i] * vol)))
+                pcm_bytes = samples.tobytes()
+
+            # Add small silence pad
+            silence = b'\x00' * (rate * 2 * channels // 30)  # ~33ms
+            pcm_bytes = silence + pcm_bytes + silence
+
+            if self.use_pulse:
+                if self._pacat_proc is None or self._pacat_proc.poll() is not None:
+                    self._start_bt_stream()
+                try:
+                    with self.lock:
+                        self._last_audio_write = time.time()
+                        self._pacat_proc.stdin.write(pcm_bytes)
+                        self._pacat_proc.stdin.flush()
+                        self._last_audio_write = time.time()
+                except (BrokenPipeError, OSError):
+                    self._start_bt_stream()
+                    with self.lock:
+                        self._last_audio_write = time.time()
+                        self._pacat_proc.stdin.write(pcm_bytes)
+                        self._pacat_proc.stdin.flush()
+                # Wait for playback duration
+                play_secs = len(pcm_bytes) / (rate * 2 * channels)
+                time.sleep(play_secs)
+            else:
+                # Route to configured audio output
+                if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
+                    aplay_device = 'plughw:Audio'
+                elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
+                    aplay_device = 'plughw:UACDemoV10'
+                elif os.path.exists('/proc/asound/Audio'):
+                    aplay_device = 'plughw:Audio'
+                elif os.path.exists('/proc/asound/UACDemoV10'):
+                    aplay_device = 'plughw:UACDemoV10'
+                else:
+                    aplay_device = 'default'
+                self._active_aplay = subprocess.Popen(
+                    ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
+                    stdin=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
+                if self._active_aplay.returncode != 0:
+                    print(f'[Speaker] aplay error: {stderr.decode().strip() if stderr else ""}'[:100])
+                self._active_aplay = None
+        except Exception as e:
+            print(f'[Speaker] PCM play error: {e}')
+
     def _play_one(self, audio_bytes):
         """Decode and play a single audio chunk."""
         try:
-            vol_filter = f'volume={VOLUME / 100.0}'
+            vol_filter = f'volume={VOLUME / 100.0},afade=t=in:d=0.03,afade=t=out:st=99:d=0.03'
             proc = subprocess.Popen(
                 ['ffmpeg', '-i', 'pipe:0', '-af', vol_filter, '-f', 'wav', '-acodec', 'pcm_s16le',
                  '-ar', '24000', '-ac', '1', 'pipe:1'],
@@ -369,19 +807,10 @@ class Speaker:
 
             if wav_data and len(wav_data) > 44:
                 pcm = wav_data[44:]
-                # Fade in first 15ms and fade out last 15ms to prevent pop
-                import struct
-                fade_samples = min(360, len(pcm) // 2)  # 15ms at 24kHz, 2 bytes per sample
-                arr = list(struct.unpack(f'<{len(pcm)//2}h', pcm))
-                for i in range(fade_samples):
-                    arr[i] = int(arr[i] * (i / fade_samples))
-                for i in range(fade_samples):
-                    arr[-(i+1)] = int(arr[-(i+1)] * (i / fade_samples))
-                pcm = struct.pack(f'<{len(arr)}h', *arr)
-                # Add 30ms silence pad at end
-                pcm += b'\x00' * 1440  # 30ms at 24kHz 16-bit mono
-                # Calculate playback duration for is_speaking timing
-                playback_secs = len(pcm) / (24000 * 2)  # 24kHz, 16-bit mono = 2 bytes/sample
+                # Silence pads: 30ms before + 30ms after to prevent pop
+                silence = b'\x00' * 1440  # 30ms at 24kHz 16-bit mono
+                pcm = silence + pcm + silence
+                playback_secs = len(pcm) / (24000 * 2)
 
                 if self.use_pulse:
                     # Route through PulseAudio (Bluetooth speaker)
@@ -401,22 +830,19 @@ class Speaker:
                             self._pacat_proc.stdin.flush()
                             self._last_audio_write = time.time()
                 else:
-                    # Direct ALSA (USB speaker) — persistent process
-                    if self._aplay_proc is None or self._aplay_proc.poll() is not None:
-                        self._aplay_proc = subprocess.Popen(
-                            ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
-                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                        )
+                    # Play via aplay — one-shot per chunk (no persistent process)
                     try:
-                        self._aplay_proc.stdin.write(pcm)
-                        self._aplay_proc.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        self._aplay_proc = subprocess.Popen(
-                            ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                        ap = subprocess.Popen(
+                            ['aplay', '-D', 'default', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
                         )
-                        self._aplay_proc.stdin.write(pcm)
-                        self._aplay_proc.stdin.flush()
+                        ap.stdin.write(pcm)
+                        ap.stdin.close()
+                        ap.wait(timeout=10)
+                    except Exception as e:
+                        print(f"[Speaker] Error: {e}")
+                        try: ap.kill()
+                        except: pass
                 # Wait for audio to actually play out before returning
                 time.sleep(playback_secs)
         except subprocess.TimeoutExpired:
@@ -453,13 +879,19 @@ async def run():
     print(f"[Droid] Connecting to {SERVER}")
     print(f"[Sleep] {'Enabled' if SLEEP_ENABLED else 'Disabled'} — idle:{IDLE_TIMEOUT}s, rms:{RMS_THRESHOLD}, debounce:{WAKE_DEBOUNCE}s")
 
-    camera = Camera(CAMERA_INDEX)
     mic = Microphone()
     speaker = Speaker()
+    speaker._mic_ref = mic
     mic.start()
+    # Let mic stream establish before opening camera (Pi 3B shared USB controller)
+    print('[Startup] Waiting 5s for mic to stabilize before opening camera...')
+    time.sleep(5)
+    camera = Camera(CAMERA_INDEX)
 
     from servo import ServoController
-    servos = ServoController()
+    servo_controller = ServoController()
+    face_tracker = FaceTracker()
+    motion_tracker = MotionTracker()
 
     url = SERVER
     if TOKEN:
@@ -481,6 +913,7 @@ async def run():
                 noise_start_time = None
 
                 ws_send_queue = []
+                speaker._ws_send_queue = ws_send_queue
 
                 await ws.send(json.dumps({
                     'type': 'device_info',
@@ -513,7 +946,42 @@ async def run():
                                         print(f'[Droid] "{text}"')
                                     # Speaking = activity
                                     last_motion_time = time.time()
-                                    speaker.enqueue(audio_bytes, msg.get('format', 'mp3'), text)
+                                    speaker.enqueue(audio_bytes, msg.get('format', 'mp3'), text,
+                                                    rate=msg.get('rate', 24000), channels=msg.get('channels', 1))
+
+                            elif msg_type == 'music_play':
+                                music_url = msg.get('url', '')
+                                music_title = msg.get('title', 'Unknown')
+                                print(f'[Music] Playing: {music_title}')
+                                music_player.play(music_url, music_title, ws_send_queue)
+
+                            elif msg_type == 'music_stop':
+                                print('[Music] Stopping')
+                                music_player.stop()
+
+                            elif msg_type == 'music_pause':
+                                print('[Music] Pause/Resume')
+                                music_player.toggle_pause()
+
+                            elif msg_type == 'music_skip':
+                                print('[Music] Skip')
+                                music_player.stop()  # Just stop current; next play command starts new
+
+                            elif msg_type == 'music_volume':
+                                vol = msg.get('level', 50)
+                                print(f'[Music] Volume: {vol}')
+                                music_player.set_volume(vol)
+
+                            elif msg_type == 'emote':
+                                emotes = msg.get('emotes', [])
+                                for e in emotes:
+                                    print(f"[Emote] {e}")
+                                    if servo_controller:
+                                        servo_controller.emote(e)
+
+                            elif msg_type == 'done_speaking':
+                                if servo_controller:
+                                    servo_controller.center()
 
                             elif msg_type == 'text':
                                 print(f"[Droid] {msg.get('text', '')}")
@@ -532,10 +1000,25 @@ async def run():
                             elif msg_type == 'servo':
                                 pan = msg.get('pan', 90)
                                 tilt = msg.get('tilt', 90)
-                                servos.look_at(pan, tilt)
+                                servo_controller.look_at(pan, tilt)
 
                             elif msg_type == 'wake':
                                 do_wake('server', ws_send_queue)
+
+                            elif msg_type == 'audio_output':
+                                target = msg.get('target', 'internal')
+                                if target == 'external' or target == 'aux' or target == 'headphone':
+                                    speaker.audio_output = Speaker.OUTPUT_EXTERNAL
+                                    speaker.use_pulse = False
+                                    print('[Speaker] Switched to external speaker (USB DAC → X-GO)')
+                                elif target == 'internal' or target == 'usb':
+                                    speaker.audio_output = Speaker.OUTPUT_INTERNAL
+                                    speaker.use_pulse = False
+                                    print('[Speaker] Switched to internal speaker (UACDemoV10)')
+                                elif target == 'bluetooth':
+                                    speaker.audio_output = Speaker.OUTPUT_BT
+                                    speaker.use_pulse = True
+                                    print('[Speaker] Switched to Bluetooth')
 
                             elif msg_type == 'camera_off':
                                 camera.disable()
@@ -619,11 +1102,14 @@ async def run():
 
                             elif msg_type == 'mic_off':
                                 mic.enabled = False
-                                print('[Droid] Mic OFF')
+                                # DON'T stop the ALSA stream — just stop buffering
+                                # Stopping/restarting ALSA on Pi 3B kills the stream
+                                print('[Droid] Mic OFF (stream stays alive)')
 
                             elif msg_type == 'mic_on':
                                 mic.enabled = True
-                                mic.start()  # Restart stream in case it died
+                                # Stream should still be running — just resume buffering
+                                # If stream actually died, health monitor will catch it
                                 print('[Droid] Mic ON')
 
                             elif msg_type == 'wifi_scan':
@@ -747,9 +1233,33 @@ async def run():
                         if sleep_state == 'awake':
                             # === AWAKE MODE ===
 
-                            # Send camera frame + check motion
+                            # Fast tracking — face priority, motion fallback, every ~300ms
+                            if servo_controller.enabled and servo_controller.kit is not None and camera.enabled and camera.cap is not None and camera.cap.isOpened():
+                                if not hasattr(camera, '_last_track_time'):
+                                    camera._last_track_time = 0
+                                if now - camera._last_track_time >= 1.0:
+                                    ret, track_frame = camera.cap.read()
+                                    if ret and track_frame is not None:
+                                        tracked = False
+                                        # Try face first
+                                        face = face_tracker.detect(track_frame)
+                                        if face:
+                                            cx, cy, fw, fh = face
+                                            servo_controller.track_face(cx, cy, track_frame.shape[1], track_frame.shape[0])
+                                            tracked = True
+                                        # Fall back to motion tracking
+                                        # Motion tracking disabled for servo — too many false positives
+                                        # (monitors, lights, TV). Face tracking only for servo movement.
+                                        # Motion detection still used for sleep/wake.
+
+                                        # No face for a while — slowly center
+                                        if not tracked and face_tracker.frames_without_face > 30:
+                                            servo_controller.center()
+                                    camera._last_track_time = now
+
+                            # Send camera frame + check motion (slower interval for server)
                             if now - last_frame_time >= FRAME_INTERVAL:
-                                # Retry opening camera if it failed
+                                # Retry opening camera if it failed (but not if intentionally disabled)
                                 if camera.enabled and (camera.cap is None or not camera.cap.isOpened()):
                                     camera._open_retries += 1
                                     if camera._open_retries % 6 == 1:  # Try every ~30s (6 * 5s frame interval)
@@ -761,10 +1271,13 @@ async def run():
                                         if detect_motion(frame):
                                             last_motion_time = now
 
+                                    # Tag frame with servo state — server skips diff if camera was moving
+                                    servo_moving = (now - servo_controller.last_move_time) < 2.0
                                     await ws.send(json.dumps({
                                         'type': 'frame',
                                         'data': base64.b64encode(jpeg).decode('ascii'),
-                                        'timestamp': now
+                                        'timestamp': now,
+                                        'servo_moving': servo_moving
                                     }))
                                     last_frame_time = now
 
@@ -784,9 +1297,10 @@ async def run():
                                     'format': 'pcm_s16le'
                                 }))
 
-                            # Check idle timeout → sleep
-                            if SLEEP_ENABLED and (now - last_motion_time) > IDLE_TIMEOUT:
+                            # Check idle timeout → sleep (skip first 120s after boot)
+                            if SLEEP_ENABLED and (now - last_motion_time) > IDLE_TIMEOUT and (now - boot_time) > 120:
                                 do_sleep(ws_send_queue)
+                                continue  # Skip rest of awake processing
 
                         else:
                             # === SLEEPING MODE ===
@@ -824,7 +1338,7 @@ async def run():
     camera.close()
     mic.close()
     speaker.close()
-    servos.close()
+    servo_controller.close()
     print("[Droid] Shutdown complete")
 
 

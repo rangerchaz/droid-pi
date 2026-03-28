@@ -44,7 +44,7 @@ The Pi is intentionally dumb. It captures audio/video, sends it over WebSocket, 
 | Part | Notes | ~Cost |
 |------|-------|-------|
 | Raspberry Pi 3B+ or newer | 2.4GHz WiFi only on 3B | $35 |
-| USB webcam with mic | Logitech C270 works great | $20 |
+| USB webcam with mic | Logitech BRIO (recommended) or C270 | $20-70 |
 | USB speaker | Any USB audio device | $10 |
 | MicroSD card | 16GB+ with Raspberry Pi OS | $8 |
 | Power supply | 5V 2.5A+ (3A if using USB speaker) | $10 |
@@ -53,16 +53,17 @@ The Pi is intentionally dumb. It captures audio/video, sends it over WebSocket, 
 | Part | Notes | ~Cost |
 |------|-------|-------|
 | Bluetooth speaker | Pairs via PulseAudio, voice-command switchable | $15+ |
-| PCA9685 servo board | Pan/tilt head tracking (I2C) — **not yet tested** | $5 |
-| Pan/tilt camera mount | SG90 servos + bracket — **not yet tested** | $10 |
+| PCA9685 servo board | Pan/tilt head tracking (I2C) | $5 |
+| Pan/tilt camera mount | SG90 servos + bracket | $10 |
 | Powered USB hub | Prevents undervoltage with multiple USB devices | $10 |
 | 3D printed body | STL files in the main droid repo | $5 filament |
 
-> ⚠️ **Servo/pan-tilt support is included but not yet tested.** The code is there (`servo.py`) but the PCA9685 board died during installation. Face tracking and idle glance movements are implemented but unverified on hardware.
+> **Face tracking** uses Haar cascade detection to find faces in the camera frame and smoothly pans/tilts the head to follow. Only runs when PCA9685 is detected — no CPU overhead on GPIO fallback.
 
 ### Tested On
 - Raspberry Pi 3 Model B (Debian 13 Trixie, aarch64)
-- Logitech C270 webcam (video + mic)
+- Logitech BRIO Ultra HD Webcam (video + mic, recommended)
+- Logitech C270 webcam (video + mic, budget option)
 - HONKYOB USB speaker (80x30x45mm pill)
 - X-GO Bluetooth speaker
 
@@ -97,7 +98,7 @@ aplay -l    # playback devices
 pcm.!default {
     type asym
     playback.pcm "plughw:UACDemoV10"   # your USB speaker card name
-    capture.pcm "plughw:U0x46d0x81a"   # your webcam mic card name
+    capture.pcm "plughw:BRIO"          # your webcam mic card name
 }
 ctl.!default {
     type hw
@@ -114,7 +115,7 @@ cp config.example.json config.json
 Edit `config.json`:
 ```json
 {
-  "server": "wss://your-droid-server.com/ws/device",
+  "server": "wss://droid.turkeycode.ai/ws/device",
   "token": "your-device-auth-token",
   "camera_index": 0,
   "volume": 250,
@@ -158,6 +159,8 @@ RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+Environment=HOME=/home/your-user
 
 [Install]
 WantedBy=multi-user.target
@@ -169,7 +172,7 @@ sudo systemctl start droid
 sudo journalctl -u droid -f  # watch logs
 ```
 
-> **Note:** `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are required for PulseAudio/Bluetooth access from systemd.
+> **Note:** `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `PULSE_SERVER`, and `HOME` are all required. Without `HOME`, PyAudio can't load `~/.asoundrc` and won't find ALSA devices. Without `PULSE_SERVER`, PulseAudio connections fail.
 
 ## Features
 
@@ -228,8 +231,9 @@ Audio routes through PulseAudio when BT is active. Persistent `pacat` process wi
 
 | File | Description |
 |------|-------------|
-| `droid-client.py` | Main client — camera, mic, speaker, WebSocket, sleep/wake |
+| `droid-client.py` | Main client — camera, mic, speaker, WebSocket, sleep/wake, face tracking |
 | `servo.py` | Pan/tilt servo control (PCA9685 or GPIO PWM fallback) |
+| `haarcascade_frontalface_default.xml` | OpenCV face detection model (for face tracking) |
 | `wifi-manager.py` | WiFi monitoring + AP fallback with config portal |
 | `config.example.json` | Example configuration |
 | `droid-wifi.service` | Systemd service for WiFi manager |
@@ -274,6 +278,8 @@ This is just the Pi client. **You need an account on the droid server for it to 
 - **Powered USB hub recommended** if running webcam + speaker from Pi USB (prevents undervoltage).
 - **PCA9685 uses I2C** — enable with `sudo raspi-config` → Interface Options → I2C.
 - **Volume scale:** 0-1000 internally. User-facing 0-10. `volume 5` = 500 = 5x amplification.
+- **Brio mic captures mono at 16kHz** — stereo downmix was unreliable, mono is cleaner for STT.
+- **Energy threshold** may need tuning per mic. Default 1500 works for Brio; C270 may need 2500.
 
 ## License
 
