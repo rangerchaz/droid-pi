@@ -879,6 +879,64 @@ async def run():
     print(f"[Droid] Connecting to {SERVER}")
     print(f"[Sleep] {'Enabled' if SLEEP_ENABLED else 'Disabled'} — idle:{IDLE_TIMEOUT}s, rms:{RMS_THRESHOLD}, debounce:{WAKE_DEBOUNCE}s")
 
+    # ── Readiness check — verify all subsystems before connecting ──
+    def check_readiness():
+        """Returns (ready: bool, issues: list[str])"""
+        import subprocess as sp
+        issues = []
+
+        # 1. PulseAudio
+        try:
+            r = sp.run(['pactl', 'info'], capture_output=True, timeout=5)
+            if r.returncode != 0:
+                issues.append('PulseAudio not responding')
+        except Exception as e:
+            issues.append(f'PulseAudio check failed: {e}')
+
+        # 2. Network — can we resolve the server?
+        import urllib.parse
+        host = urllib.parse.urlparse(SERVER.replace('wss://', 'https://').replace('ws://', 'http://')).hostname
+        try:
+            import socket
+            socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except Exception as e:
+            issues.append(f'Cannot resolve {host}: {e}')
+
+        # 3. Server reachable — HTTP health check
+        try:
+            import urllib.request
+            base_url = SERVER.replace('wss://', 'https://').replace('ws://', 'http://').split('/ws')[0]
+            req = urllib.request.Request(f'{base_url}/health', method='GET')
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status != 200:
+                issues.append(f'Server health check returned {resp.status}')
+        except Exception as e:
+            issues.append(f'Server unreachable: {e}')
+
+        # 4. Audio output device exists
+        try:
+            r = sp.run(['aplay', '-l'], capture_output=True, text=True, timeout=5)
+            if 'card' not in r.stdout.lower():
+                issues.append('No audio output devices found')
+        except Exception as e:
+            issues.append(f'Audio device check failed: {e}')
+
+        return (len(issues) == 0, issues)
+
+    max_retries = 10
+    for attempt in range(max_retries):
+        ready, issues = check_readiness()
+        if ready:
+            print(f'[Startup] ✅ All systems ready (attempt {attempt + 1})')
+            break
+        print(f'[Startup] ⏳ Not ready (attempt {attempt + 1}/{max_retries}): {", ".join(issues)}')
+        if attempt < max_retries - 1:
+            wait = min(5 + attempt * 2, 15)  # 5s, 7s, 9s, ... up to 15s
+            time.sleep(wait)
+    else:
+        print(f'[Startup] ⚠️ Starting anyway after {max_retries} attempts — issues: {", ".join(issues)}')
+
+    # ── Initialize hardware ──
     mic = Microphone()
     speaker = Speaker()
     speaker._mic_ref = mic
@@ -892,6 +950,22 @@ async def run():
     servo_controller = ServoController()
     face_tracker = FaceTracker()
     motion_tracker = MotionTracker()
+
+    # ── Verify mic is actually capturing ──
+    mic_check_start = time.time()
+    while time.time() - mic_check_start < 10:
+        if mic.enabled and hasattr(mic, 'last_callback_time') and mic.last_callback_time > mic_check_start:
+            print('[Startup] ✅ Mic stream confirmed active')
+            break
+        time.sleep(0.5)
+    else:
+        print('[Startup] ⚠️ Mic stream not confirmed — will rely on health monitor')
+
+    # ── Verify camera opened ──
+    if camera.enabled:
+        print('[Startup] ✅ Camera open')
+    else:
+        print('[Startup] ⚠️ Camera failed to open — retry loop will handle it')
 
     url = SERVER
     if TOKEN:
