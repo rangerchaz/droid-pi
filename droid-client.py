@@ -774,17 +774,8 @@ class Speaker:
                 play_secs = len(pcm_bytes) / (rate * 2 * channels)
                 time.sleep(play_secs)
             else:
-                # Route to configured audio output
-                if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'plughw:Audio'
-                elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'plughw:UACDemoV10'
-                elif os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'plughw:Audio'
-                elif os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'plughw:UACDemoV10'
-                else:
-                    aplay_device = 'default'
+                # Route through PulseAudio to avoid "device busy" when pulse holds the card
+                aplay_device = 'pulse'
                 self._active_aplay = subprocess.Popen(
                     ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
                     stdin=subprocess.PIPE, stderr=subprocess.PIPE
@@ -835,7 +826,7 @@ class Speaker:
                     # Play via aplay — one-shot per chunk (no persistent process)
                     try:
                         ap = subprocess.Popen(
-                            ['aplay', '-D', 'default', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            ['aplay', '-D', 'pulse', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
                         )
                         ap.stdin.write(pcm)
@@ -862,7 +853,7 @@ class Speaker:
         try:
             silence = b'\x00' * 4800
             proc = subprocess.Popen(
-                ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
+                ['aplay', '-D', 'pulse', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             proc.communicate(input=silence, timeout=2)
