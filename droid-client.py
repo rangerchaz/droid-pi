@@ -648,6 +648,25 @@ class Speaker:
         self._mic_ref = None  # Set after mic is created, for echo flush
         self._ws_send_queue = None  # Set to ws_send_queue for playback_done signal
 
+    def _alsa_device(self):
+        """Return the direct ALSA device string for the current output target.
+
+        Bypasses PulseAudio entirely for internal/external speakers — Pulse
+        is only used for Bluetooth (via the pacat path). This avoids the
+        whole class of failures where Pulse dies mid-session and aplay
+        starts erroring out 'Unable to connect: Connection refused'.
+        """
+        if self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
+            return 'plughw:UACDemoV10'
+        if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
+            return 'plughw:Audio'
+        # Fallbacks if the configured card disappeared
+        if os.path.exists('/proc/asound/UACDemoV10'):
+            return 'plughw:UACDemoV10'
+        if os.path.exists('/proc/asound/Audio'):
+            return 'plughw:Audio'
+        return 'default'
+
     def _flush_mic(self):
         """Flush buffered mic data to prevent echo from being processed."""
         try:
@@ -774,8 +793,8 @@ class Speaker:
                 play_secs = len(pcm_bytes) / (rate * 2 * channels)
                 time.sleep(play_secs)
             else:
-                # Route through PulseAudio to avoid "device busy" when pulse holds the card
-                aplay_device = 'pulse'
+                # Direct ALSA — no PulseAudio in the path for wired speakers.
+                aplay_device = self._alsa_device()
                 self._active_aplay = subprocess.Popen(
                     ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
                     stdin=subprocess.PIPE, stderr=subprocess.PIPE
@@ -826,7 +845,7 @@ class Speaker:
                     # Play via aplay — one-shot per chunk (no persistent process)
                     try:
                         ap = subprocess.Popen(
-                            ['aplay', '-D', 'pulse', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            ['aplay', '-D', self._alsa_device(), '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
                         )
                         ap.stdin.write(pcm)
@@ -853,7 +872,7 @@ class Speaker:
         try:
             silence = b'\x00' * 4800
             proc = subprocess.Popen(
-                ['aplay', '-D', 'pulse', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
+                ['aplay', '-D', self._alsa_device(), '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             proc.communicate(input=silence, timeout=2)
