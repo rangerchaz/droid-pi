@@ -642,11 +642,42 @@ class Speaker:
             self.audio_output = self.OUTPUT_EXTERNAL
         else:
             self.audio_output = self.OUTPUT_INTERNAL
+        # Tell PulseAudio to release any wired USB sinks so we can open them
+        # directly via ALSA. Pulse stays running for the Bluetooth (pacat) path.
+        self._suspend_pulse_wired_sinks()
         self._silence_thread = None
         self._silence_stop = threading.Event()
         self._last_audio_write = 0  # timestamp of last real audio write
         self._mic_ref = None  # Set after mic is created, for echo flush
         self._ws_send_queue = None  # Set to ws_send_queue for playback_done signal
+
+    def _suspend_pulse_wired_sinks(self):
+        """Free wired USB audio cards from PulseAudio's grip.
+
+        Pulse auto-grabs USB DACs on connect and holds them exclusively, so
+        a direct `aplay -D plughw:...` fails with "Device or resource busy".
+        We suspend just the wired sinks (UACDemo / Audio / KT USB), leaving
+        any Bluetooth sink alone since the BT pacat path still uses Pulse.
+        """
+        try:
+            r = subprocess.run(['pactl', 'list', 'short', 'sinks'],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode != 0:
+                return
+            for line in r.stdout.splitlines():
+                fields = line.split()
+                if len(fields) < 2:
+                    continue
+                sink = fields[1]
+                lower = sink.lower()
+                if 'bluez' in lower or 'a2dp' in lower or 'bluetooth' in lower:
+                    continue   # leave BT alone
+                if 'usb' in lower or 'uacdemo' in lower or 'audio' in lower:
+                    subprocess.run(['pactl', 'suspend-sink', sink, '1'],
+                                   capture_output=True, timeout=3)
+                    print(f'[Speaker] Suspended Pulse sink: {sink}')
+        except Exception as e:
+            print(f'[Speaker] suspend-sink error (non-fatal): {e}')
 
     def _alsa_device(self):
         """Return the direct ALSA device string for the current output target.
