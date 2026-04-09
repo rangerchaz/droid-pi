@@ -1,11 +1,12 @@
 [Unit]
 Description=Droid Client
-After=network-online.target
-Wants=network-online.target
+# Order after the user session so /run/user/%U/{pulse,bus} exist before we
+# start. Requires `loginctl enable-linger <user>` (install.sh sets this).
+After=network-online.target user@%U.service
+Wants=network-online.target user@%U.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do pactl info >/dev/null 2>&1 && exit 0; sleep 1; done; echo PulseAudio not ready'
 ExecStart=/usr/bin/python3 %h/droid/droid-client.py
 WorkingDirectory=%h/droid
 Restart=always

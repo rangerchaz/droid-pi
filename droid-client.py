@@ -825,17 +825,59 @@ class Speaker:
                 time.sleep(play_secs)
             else:
                 # Direct ALSA — no PulseAudio in the path for wired speakers.
-                aplay_device = self._alsa_device()
-                self._active_aplay = subprocess.Popen(
-                    ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
-                    stdin=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
-                if self._active_aplay.returncode != 0:
-                    print(f'[Speaker] aplay error: {stderr.decode().strip() if stderr else ""}'[:100])
-                self._active_aplay = None
+                self._run_aplay(pcm_bytes, rate, channels)
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
+            self._reap_active_aplay()
+
+    def _run_aplay(self, pcm_bytes, rate, channels):
+        """Spawn aplay, write PCM, and guarantee the child is reaped — even on
+        timeout or error. Critical: subprocess.communicate(timeout=...) does NOT
+        kill the child on TimeoutExpired; we must do it ourselves or the USB
+        device stays locked and the next playback hangs forever."""
+        aplay_device = self._alsa_device()
+        # Generous timeout: playback time + 5s slack. A USB stall longer than
+        # this is a real fault and we want to recover, not wait indefinitely.
+        playback_secs = len(pcm_bytes) / (rate * 2 * channels)
+        timeout = playback_secs + 5.0
+        self._active_aplay = subprocess.Popen(
+            ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        try:
+            _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=timeout)
+            if self._active_aplay.returncode != 0:
+                msg = stderr.decode().strip() if stderr else ''
+                print(f'[Speaker] aplay error: {msg}'[:200])
+        except subprocess.TimeoutExpired:
+            print(f'[Speaker] aplay stalled after {timeout:.1f}s — killing (USB stall?)')
+            self._reap_active_aplay()
+        finally:
+            self._active_aplay = None
+
+    def _reap_active_aplay(self):
+        """Forcefully kill+wait any active aplay child so the audio device is
+        released. Safe to call from any thread; never raises."""
+        proc = getattr(self, '_active_aplay', None)
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Belt-and-suspenders: if anything else left an aplay running on our
+        # device (e.g. a previous crashed run), nuke it too. aplay is only ever
+        # spawned by us, so this is safe.
+        try:
+            subprocess.run(['pkill', '-9', '-f', 'aplay -D plughw:'],
+                           stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            pass
 
     def _play_one(self, audio_bytes):
         """Decode and play a single audio chunk."""
@@ -873,26 +915,18 @@ class Speaker:
                             self._pacat_proc.stdin.flush()
                             self._last_audio_write = time.time()
                 else:
-                    # Play via aplay — one-shot per chunk (no persistent process)
-                    try:
-                        ap = subprocess.Popen(
-                            ['aplay', '-D', self._alsa_device(), '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
-                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                        )
-                        ap.stdin.write(pcm)
-                        ap.stdin.close()
-                        ap.wait(timeout=10)
-                    except Exception as e:
-                        print(f"[Speaker] Error: {e}")
-                        try: ap.kill()
-                        except: pass
-                # Wait for audio to actually play out before returning
-                time.sleep(playback_secs)
+                    # Play via aplay — one-shot per chunk, with proper
+                    # timeout-and-kill so a USB stall can't wedge the speaker.
+                    self._run_aplay(pcm, 24000, 1)
+                # _run_aplay already waited for playback; no extra sleep needed
         except subprocess.TimeoutExpired:
-            print("[Speaker] Timeout — killing audio")
-            subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
+            print("[Speaker] ffmpeg timeout — killing")
+            try: proc.kill()
+            except Exception: pass
+            self._reap_active_aplay()
         except Exception as e:
             print(f"[Speaker] Error: {e}")
+            self._reap_active_aplay()
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
         """Legacy non-queued playback."""

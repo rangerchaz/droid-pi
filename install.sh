@@ -33,18 +33,27 @@ if [ ! -f "$DROID_DIR/config.json" ]; then
   echo ""
 fi
 
+# Enable linger so the user's session (and its PulseAudio) starts at boot
+# rather than only on first login. Without this, /run/user/$USER_ID does not
+# exist when droid.service starts on boot, and PulseAudio is unreachable
+# until you log in interactively. With linger, the user session is created
+# during boot and we can order droid after it.
+echo "🔒 Enabling user-session linger so PulseAudio is up at boot..."
+sudo loginctl enable-linger "$USER_NAME"
+
 # Create systemd service
 echo "⚙️  Setting up systemd service..."
 cat > /tmp/droid.service << EOF
 [Unit]
 Description=Droid Client
-After=network-online.target
-Wants=network-online.target
+# Order after the user session so /run/user/$USER_ID/{pulse,bus} exist before
+# we start. enable-linger above makes user@$USER_ID.service activate at boot.
+After=network-online.target user@$USER_ID.service
+Wants=network-online.target user@$USER_ID.service
 
 [Service]
 Type=simple
 User=$USER_NAME
-ExecStartPre=/bin/bash -c 'for i in \$(seq 1 30); do pactl info >/dev/null 2>&1 && exit 0; sleep 1; done; echo PulseAudio not ready'
 ExecStart=/usr/bin/python3 $DROID_DIR/droid-client.py
 WorkingDirectory=$DROID_DIR
 Restart=always
