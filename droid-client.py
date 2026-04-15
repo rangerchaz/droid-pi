@@ -870,8 +870,15 @@ class Speaker:
         try:
             self._aplay_proc = subprocess.Popen(
                 ['aplay', '-D', device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q', '--buffer-size=32768'],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE
             )
+            # Give aplay 300ms to open the device — if it exits immediately it's busy
+            time.sleep(0.3)
+            if self._aplay_proc.poll() is not None:
+                err = self._aplay_proc.stderr.read().decode(errors='ignore').strip()
+                print(f'[Speaker] aplay exited immediately: {err}'[:150])
+                self._aplay_proc = None
+                return
             print(f'[Speaker] Persistent aplay started on {device} @ {rate}Hz')
         except Exception as e:
             print(f'[Speaker] Failed to start aplay: {e}')
