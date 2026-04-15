@@ -53,7 +53,7 @@ with open(CONFIG_PATH) as f:
     config = json.load(f)
 
 # User config
-SERVER = 'wss://droid.turkeycode.ai/ws/device'
+SERVER = 'wss://meckie.ai/ws/device'
 TOKEN = config.get('token', '')
 CAMERA_INDEX = config.get('camera_index', 0)
 VOLUME = config.get('volume', 250)
@@ -145,7 +145,7 @@ def do_sleep(ws_send_queue):
         return
     sleep_state = 'sleeping'
     camera.disable()
-    servo_controller.center()  # Look forward when sleeping
+    if servo_controller: servo_controller.center()  # Look forward when sleeping
     motion_tracker.prev_gray = None  # Reset so wake doesn't trigger false motion
     print("[Sleep] 💤 Sleeping — no activity for", IDLE_TIMEOUT, "seconds")
     ws_send_queue.append(json.dumps({'type': 'sleep_state', 'state': 'sleeping'}))
@@ -642,61 +642,11 @@ class Speaker:
             self.audio_output = self.OUTPUT_EXTERNAL
         else:
             self.audio_output = self.OUTPUT_INTERNAL
-        # Tell PulseAudio to release any wired USB sinks so we can open them
-        # directly via ALSA. Pulse stays running for the Bluetooth (pacat) path.
-        self._suspend_pulse_wired_sinks()
         self._silence_thread = None
         self._silence_stop = threading.Event()
         self._last_audio_write = 0  # timestamp of last real audio write
         self._mic_ref = None  # Set after mic is created, for echo flush
         self._ws_send_queue = None  # Set to ws_send_queue for playback_done signal
-
-    def _suspend_pulse_wired_sinks(self):
-        """Free wired USB audio cards from PulseAudio's grip.
-
-        Pulse auto-grabs USB DACs on connect and holds them exclusively, so
-        a direct `aplay -D plughw:...` fails with "Device or resource busy".
-        We suspend just the wired sinks (UACDemo / Audio / KT USB), leaving
-        any Bluetooth sink alone since the BT pacat path still uses Pulse.
-        """
-        try:
-            r = subprocess.run(['pactl', 'list', 'short', 'sinks'],
-                               capture_output=True, text=True, timeout=3)
-            if r.returncode != 0:
-                return
-            for line in r.stdout.splitlines():
-                fields = line.split()
-                if len(fields) < 2:
-                    continue
-                sink = fields[1]
-                lower = sink.lower()
-                if 'bluez' in lower or 'a2dp' in lower or 'bluetooth' in lower:
-                    continue   # leave BT alone
-                if 'usb' in lower or 'uacdemo' in lower or 'audio' in lower:
-                    subprocess.run(['pactl', 'suspend-sink', sink, '1'],
-                                   capture_output=True, timeout=3)
-                    print(f'[Speaker] Suspended Pulse sink: {sink}')
-        except Exception as e:
-            print(f'[Speaker] suspend-sink error (non-fatal): {e}')
-
-    def _alsa_device(self):
-        """Return the direct ALSA device string for the current output target.
-
-        Bypasses PulseAudio entirely for internal/external speakers — Pulse
-        is only used for Bluetooth (via the pacat path). This avoids the
-        whole class of failures where Pulse dies mid-session and aplay
-        starts erroring out 'Unable to connect: Connection refused'.
-        """
-        if self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
-            return 'plughw:UACDemoV10'
-        if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
-            return 'plughw:Audio'
-        # Fallbacks if the configured card disappeared
-        if os.path.exists('/proc/asound/UACDemoV10'):
-            return 'plughw:UACDemoV10'
-        if os.path.exists('/proc/asound/Audio'):
-            return 'plughw:Audio'
-        return 'default'
 
     def _flush_mic(self):
         """Flush buffered mic data to prevent echo from being processed."""
@@ -824,60 +774,27 @@ class Speaker:
                 play_secs = len(pcm_bytes) / (rate * 2 * channels)
                 time.sleep(play_secs)
             else:
-                # Direct ALSA — no PulseAudio in the path for wired speakers.
-                self._run_aplay(pcm_bytes, rate, channels)
+                # Route to configured audio output
+                if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
+                    aplay_device = 'plughw:Audio'
+                elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
+                    aplay_device = 'plughw:UACDemoV10'
+                elif os.path.exists('/proc/asound/Audio'):
+                    aplay_device = 'plughw:Audio'
+                elif os.path.exists('/proc/asound/UACDemoV10'):
+                    aplay_device = 'plughw:UACDemoV10'
+                else:
+                    aplay_device = 'default'
+                self._active_aplay = subprocess.Popen(
+                    ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
+                    stdin=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
+                if self._active_aplay.returncode != 0:
+                    print(f'[Speaker] aplay error: {stderr.decode().strip() if stderr else ""}'[:100])
+                self._active_aplay = None
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
-            self._reap_active_aplay()
-
-    def _run_aplay(self, pcm_bytes, rate, channels):
-        """Spawn aplay, write PCM, and guarantee the child is reaped — even on
-        timeout or error. Critical: subprocess.communicate(timeout=...) does NOT
-        kill the child on TimeoutExpired; we must do it ourselves or the USB
-        device stays locked and the next playback hangs forever."""
-        aplay_device = self._alsa_device()
-        # Generous timeout: playback time + 5s slack. A USB stall longer than
-        # this is a real fault and we want to recover, not wait indefinitely.
-        playback_secs = len(pcm_bytes) / (rate * 2 * channels)
-        timeout = playback_secs + 5.0
-        self._active_aplay = subprocess.Popen(
-            ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
-            stdin=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        try:
-            _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=timeout)
-            if self._active_aplay.returncode != 0:
-                msg = stderr.decode().strip() if stderr else ''
-                print(f'[Speaker] aplay error: {msg}'[:200])
-        except subprocess.TimeoutExpired:
-            print(f'[Speaker] aplay stalled after {timeout:.1f}s — killing (USB stall?)')
-            self._reap_active_aplay()
-        finally:
-            self._active_aplay = None
-
-    def _reap_active_aplay(self):
-        """Forcefully kill+wait any active aplay child so the audio device is
-        released. Safe to call from any thread; never raises."""
-        proc = getattr(self, '_active_aplay', None)
-        if not proc:
-            return
-        try:
-            if proc.poll() is None:
-                proc.kill()
-            try:
-                proc.communicate(timeout=2)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # Belt-and-suspenders: if anything else left an aplay running on our
-        # device (e.g. a previous crashed run), nuke it too. aplay is only ever
-        # spawned by us, so this is safe.
-        try:
-            subprocess.run(['pkill', '-9', '-f', 'aplay -D plughw:'],
-                           stderr=subprocess.DEVNULL, timeout=2)
-        except Exception:
-            pass
 
     def _play_one(self, audio_bytes):
         """Decode and play a single audio chunk."""
@@ -915,18 +832,26 @@ class Speaker:
                             self._pacat_proc.stdin.flush()
                             self._last_audio_write = time.time()
                 else:
-                    # Play via aplay — one-shot per chunk, with proper
-                    # timeout-and-kill so a USB stall can't wedge the speaker.
-                    self._run_aplay(pcm, 24000, 1)
-                # _run_aplay already waited for playback; no extra sleep needed
+                    # Play via aplay — one-shot per chunk (no persistent process)
+                    try:
+                        ap = subprocess.Popen(
+                            ['aplay', '-D', 'default', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                        ap.stdin.write(pcm)
+                        ap.stdin.close()
+                        ap.wait(timeout=10)
+                    except Exception as e:
+                        print(f"[Speaker] Error: {e}")
+                        try: ap.kill()
+                        except: pass
+                # Wait for audio to actually play out before returning
+                time.sleep(playback_secs)
         except subprocess.TimeoutExpired:
-            print("[Speaker] ffmpeg timeout — killing")
-            try: proc.kill()
-            except Exception: pass
-            self._reap_active_aplay()
+            print("[Speaker] Timeout — killing audio")
+            subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"[Speaker] Error: {e}")
-            self._reap_active_aplay()
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
         """Legacy non-queued playback."""
@@ -937,7 +862,7 @@ class Speaker:
         try:
             silence = b'\x00' * 4800
             proc = subprocess.Popen(
-                ['aplay', '-D', self._alsa_device(), '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
+                ['aplay', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-q', '-'],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             proc.communicate(input=silence, timeout=2)
@@ -1023,8 +948,12 @@ async def run():
     time.sleep(5)
     camera = Camera(CAMERA_INDEX)
 
-    from servo import ServoController
-    servo_controller = ServoController()
+    try:
+        from servo import ServoController
+        servo_controller = ServoController()
+    except Exception as e:
+        print(f'[Droid] Servo not available: {e}')
+        servo_controller = None
     face_tracker = FaceTracker()
     motion_tracker = MotionTracker()
 
@@ -1152,7 +1081,7 @@ async def run():
                             elif msg_type == 'servo':
                                 pan = msg.get('pan', 90)
                                 tilt = msg.get('tilt', 90)
-                                servo_controller.look_at(pan, tilt)
+                                if servo_controller: servo_controller.look_at(pan, tilt)
 
                             elif msg_type == 'wake':
                                 do_wake('server', ws_send_queue)
@@ -1304,8 +1233,10 @@ async def run():
                                 ssid = msg.get('ssid', '')
                                 pw = msg.get('password', '')
                                 try:
-                                    result = sp.run(['nmcli', 'device', 'wifi', 'connect', ssid, 'password', pw, 'ifname', 'wlan0'],
-                                                   capture_output=True, text=True, timeout=30)
+                                    cmd = ['nmcli', 'device', 'wifi', 'connect', ssid, 'ifname', 'wlan0']
+                                    if pw:
+                                        cmd += ['password', pw]
+                                    result = sp.run(cmd, capture_output=True, text=True, timeout=30)
                                     success = result.returncode == 0
                                     if success:
                                         sp.run(['nmcli', 'connection', 'modify', ssid, 'connection.autoconnect', 'yes', 'connection.autoconnect-retries', '0'],
@@ -1435,7 +1366,7 @@ async def run():
                             # === AWAKE MODE ===
 
                             # Fast tracking — face priority, motion fallback, every ~300ms
-                            if servo_controller.enabled and servo_controller.kit is not None and camera.enabled and camera.cap is not None and camera.cap.isOpened():
+                            if servo_controller and servo_controller.enabled and servo_controller.kit is not None and camera.enabled and camera.cap is not None and camera.cap.isOpened():
                                 if not hasattr(camera, '_last_track_time'):
                                     camera._last_track_time = 0
                                 if now - camera._last_track_time >= 1.0:
@@ -1473,7 +1404,7 @@ async def run():
                                             last_motion_time = now
 
                                     # Tag frame with servo state — server skips diff if camera was moving
-                                    servo_moving = (now - servo_controller.last_move_time) < 2.0
+                                    servo_moving = servo_controller and (now - servo_controller.last_move_time) < 2.0
                                     await ws.send(json.dumps({
                                         'type': 'frame',
                                         'data': base64.b64encode(jpeg).decode('ascii'),
@@ -1539,7 +1470,7 @@ async def run():
     camera.close()
     mic.close()
     speaker.close()
-    servo_controller.close()
+    if servo_controller: servo_controller.close()
     print("[Droid] Shutdown complete")
 
 
