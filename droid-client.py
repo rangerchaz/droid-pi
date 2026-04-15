@@ -232,7 +232,7 @@ class Camera:
         return frame, jpeg.tobytes()
 
     def close(self):
-        self.cap.release()
+        if self.cap: self.cap.release()
 
 
 # --- Face tracker (Haar cascade, runs on Pi, no API cost) ---
