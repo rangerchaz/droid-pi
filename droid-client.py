@@ -785,14 +785,19 @@ class Speaker:
                     aplay_device = 'plughw:UACDemoV10'
                 else:
                     aplay_device = 'default'
-                self._active_aplay = subprocess.Popen(
-                    ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
-                    stdin=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
-                if self._active_aplay.returncode != 0:
+                for _attempt in range(5):
+                    self._active_aplay = subprocess.Popen(
+                        ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
+                        stdin=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
+                    self._active_aplay = None
+                    if not stderr or b'busy' not in stderr.lower():
+                        break
+                    print(f'[Speaker] Device busy, retrying in 200ms... (attempt {_attempt+1})')
+                    time.sleep(0.2)
+                else:
                     print(f'[Speaker] aplay error: {stderr.decode().strip() if stderr else ""}'[:100])
-                self._active_aplay = None
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
 
