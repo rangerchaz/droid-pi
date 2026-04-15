@@ -851,7 +851,18 @@ class Speaker:
         """Legacy non-queued playback."""
         self.enqueue(audio_bytes, audio_format)
 
+    def _pulse_available(self):
+        """Check if PulseAudio is running."""
+        try:
+            r = subprocess.run(['pactl', 'info'], capture_output=True, timeout=2)
+            return r.returncode == 0
+        except Exception:
+            return False
+
     def _get_aplay_device(self):
+        # If PulseAudio owns the hardware, route through it
+        if self._pulse_available():
+            return 'pulse'
         if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
             return 'plughw:Audio'
         elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
@@ -876,7 +887,7 @@ class Speaker:
             time.sleep(0.3)
             if self._aplay_proc.poll() is not None:
                 err = self._aplay_proc.stderr.read().decode(errors='ignore').strip()
-                print(f'[Speaker] aplay exited immediately: {err}'[:150])
+                print(f'[Speaker] aplay exited immediately on {device}: {err}'[:150])
                 self._aplay_proc = None
                 return
             print(f'[Speaker] Persistent aplay started on {device} @ {rate}Hz')
