@@ -774,30 +774,19 @@ class Speaker:
                 play_secs = len(pcm_bytes) / (rate * 2 * channels)
                 time.sleep(play_secs)
             else:
-                # Route to configured audio output — use dmix where possible for shared access
-                if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'dmix:Audio'
-                elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'dmix:UACDemoV10'
-                elif os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'dmix:Audio'
-                elif os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'dmix:UACDemoV10'
-                else:
-                    aplay_device = 'default'
-                for _attempt in range(5):
-                    self._active_aplay = subprocess.Popen(
-                        ['aplay', '-D', aplay_device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q'],
-                        stdin=subprocess.PIPE, stderr=subprocess.PIPE
-                    )
-                    _, stderr = self._active_aplay.communicate(input=pcm_bytes, timeout=30)
-                    self._active_aplay = None
-                    if not stderr or b'busy' not in stderr.lower():
-                        break
-                    print(f'[Speaker] Device busy, retrying in 200ms... (attempt {_attempt+1})')
-                    time.sleep(0.2)
-                else:
-                    print(f'[Speaker] aplay error: {stderr.decode().strip() if stderr else ""}'[:100])
+                # Route through persistent aplay process — avoids open/close on every chunk
+                self._ensure_aplay_stream(rate, channels)
+                if self._aplay_proc and self._aplay_proc.poll() is None:
+                    try:
+                        with self.lock:
+                            self._aplay_proc.stdin.write(pcm_bytes)
+                            self._aplay_proc.stdin.flush()
+                        # Wait for approximate playback duration
+                        play_secs = len(pcm_bytes) / (rate * 2 * channels)
+                        time.sleep(play_secs)
+                    except (BrokenPipeError, OSError):
+                        print('[Speaker] aplay pipe broken — restarting stream')
+                        self._aplay_proc = None
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
 
@@ -862,6 +851,41 @@ class Speaker:
         """Legacy non-queued playback."""
         self.enqueue(audio_bytes, audio_format)
 
+    def _get_aplay_device(self):
+        if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
+            return 'plughw:Audio'
+        elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
+            return 'plughw:UACDemoV10'
+        elif os.path.exists('/proc/asound/Audio'):
+            return 'plughw:Audio'
+        elif os.path.exists('/proc/asound/UACDemoV10'):
+            return 'plughw:UACDemoV10'
+        return 'default'
+
+    def _ensure_aplay_stream(self, rate=24000, channels=1):
+        """Start or restart the persistent aplay stream."""
+        if self._aplay_proc and self._aplay_proc.poll() is None:
+            return  # Already running
+        device = self._get_aplay_device()
+        try:
+            self._aplay_proc = subprocess.Popen(
+                ['aplay', '-D', device, '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-q', '--buffer-size=32768'],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            print(f'[Speaker] Persistent aplay started on {device} @ {rate}Hz')
+        except Exception as e:
+            print(f'[Speaker] Failed to start aplay: {e}')
+            self._aplay_proc = None
+
+    def _stop_aplay_stream(self):
+        if self._aplay_proc:
+            try:
+                self._aplay_proc.stdin.close()
+                self._aplay_proc.wait(timeout=2)
+            except Exception:
+                self._aplay_proc.kill()
+            self._aplay_proc = None
+
     def keep_alive(self):
         """Play silence to prevent audio device from sleeping."""
         try:
@@ -875,7 +899,7 @@ class Speaker:
             pass
 
     def close(self):
-        pass
+        self._stop_aplay_stream()
 
 
 camera = None  # Global ref for sleep/wake
