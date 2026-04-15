@@ -774,15 +774,15 @@ class Speaker:
                 play_secs = len(pcm_bytes) / (rate * 2 * channels)
                 time.sleep(play_secs)
             else:
-                # Route to configured audio output
+                # Route to configured audio output — use dmix where possible for shared access
                 if self.audio_output == self.OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'plughw:Audio'
+                    aplay_device = 'dmix:Audio'
                 elif self.audio_output == self.OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'plughw:UACDemoV10'
+                    aplay_device = 'dmix:UACDemoV10'
                 elif os.path.exists('/proc/asound/Audio'):
-                    aplay_device = 'plughw:Audio'
+                    aplay_device = 'dmix:Audio'
                 elif os.path.exists('/proc/asound/UACDemoV10'):
-                    aplay_device = 'plughw:UACDemoV10'
+                    aplay_device = 'dmix:UACDemoV10'
                 else:
                     aplay_device = 'default'
                 for _attempt in range(5):
