@@ -375,6 +375,7 @@ class Microphone:
         self.enabled = True
         self.last_callback_time = time.time()
         self._health_thread = None
+        self._ws_send_queue = None  # set via attach_ws_sender — used by voice interrupt
 
     def _find_capture_device(self):
         """Find the USB webcam mic — try all PyAudio devices with input channels."""
@@ -490,18 +491,36 @@ class Microphone:
         self.last_callback_time = time.time()
         if not self.enabled:
             return (None, pyaudio.paContinue)  # Keep stream alive, discard data
-        if not is_speaking:
-            # Downmix stereo to mono — average both channels
-            if getattr(self, '_actual_channels', MIC_CHANNELS) == 2:
-                import array
-                samples = array.array('h', data)
-                left = samples[0::2]
-                right = samples[1::2]
-                mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
-                data = mono.tobytes()
-            with self.lock:
-                self.buffer.append(data)
+
+        # Downmix stereo to mono for any processing below
+        if getattr(self, '_actual_channels', MIC_CHANNELS) == 2:
+            import array
+            samples = array.array('h', data)
+            left = samples[0::2]
+            right = samples[1::2]
+            mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
+            data = mono.tobytes()
+
+        # Always buffer — even during is_speaking. The server will transcribe
+        # whatever comes in and compare to what the droid is currently saying.
+        # If the transcript matches the TTS line → echo, droppped server-side.
+        # If it differs → user is talking over the droid → interrupt.
+        with self.lock:
+            self.buffer.append(data)
         return (None, pyaudio.paContinue)
+
+    def _trigger_interrupt(self):
+        """Called from voice-interrupt detector. Kills playback and tells server."""
+        try:
+            global speaker
+            if speaker is not None:
+                speaker.interrupt()
+            # ws_send_queue is a plain list in this codebase — append JSON strings
+            if self._ws_send_queue is not None:
+                import json as _json
+                self._ws_send_queue.append(_json.dumps({'type': 'user_interrupted'}))
+        except Exception as e:
+            print(f'[Mic] Interrupt trigger error: {e}')
 
     def get_audio(self):
         with self.lock:
@@ -692,8 +711,9 @@ class Speaker:
                     self._play_one(audio_bytes)
         finally:
             time.sleep(0.3)
-            # Flush any buffered mic data that captured our own speech
-            self._flush_mic()
+            # Don't flush — we want mid-playback captures to reach the server
+            # so the transcript-based echo filter can distinguish the droid's
+            # own speech from real user interruptions.
             is_speaking = False
             # Notify server that playback is actually done
             if self._ws_send_queue is not None:
@@ -1041,6 +1061,7 @@ async def run():
 
                 ws_send_queue = []
                 speaker._ws_send_queue = ws_send_queue
+                mic._ws_send_queue = ws_send_queue  # voice-interrupt path
 
                 await ws.send(json.dumps({
                     'type': 'device_info',
@@ -1227,6 +1248,14 @@ async def run():
                                     print('[Droid] Switched to USB speaker')
                                 except Exception as e:
                                     print(f'[Droid] Speaker switch error: {e}')
+
+                            elif msg_type == 'interrupt':
+                                # Emergency stop — kill current playback, clear queue
+                                try:
+                                    speaker.interrupt()
+                                    print('[Droid] INTERRUPT — playback killed')
+                                except Exception as e:
+                                    print(f'[Droid] Interrupt error: {e}')
 
                             elif msg_type == 'mic_off':
                                 mic.enabled = False
@@ -1463,9 +1492,11 @@ async def run():
                             # Send audio to server for STT
                             audio = mic.get_audio()
                             if audio:
-                                # Audio activity also resets idle (if loud enough)
+                                # Audio activity also resets idle (if loud enough).
+                                # Skip during is_speaking — the droid's own voice
+                                # shouldn't count as "someone is here."
                                 rms = compute_rms(audio)
-                                if rms > RMS_THRESHOLD:
+                                if rms > RMS_THRESHOLD and not is_speaking:
                                     last_motion_time = now
 
                                 await ws.send(json.dumps({
