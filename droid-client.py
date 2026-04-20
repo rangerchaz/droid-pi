@@ -21,6 +21,7 @@ import threading
 import subprocess
 import struct
 import math
+from collections import deque
 
 CLIENT_VERSION = '1.0.0'
 
@@ -686,13 +687,18 @@ class Speaker:
                 threading.Thread(target=self._play_queue, daemon=True).start()
 
     def interrupt(self):
-        """Stop current playback and clear queue."""
+        """Stop current playback and clear queue. Kill happens under self.lock
+        so a concurrent _play_one() can't write to a half-killed pipe."""
         with self.queue_lock:
             self.queue.clear()
         self._interrupted = True
-        # Kill any active aplay
-        if hasattr(self, '_active_aplay') and self._active_aplay and self._active_aplay.poll() is None:
-            self._active_aplay.kill()
+        with self.lock:
+            ap = getattr(self, '_active_aplay', None)
+            if ap and ap.poll() is None:
+                try:
+                    ap.kill()
+                except Exception:
+                    pass
 
     def _play_queue(self):
         """Play all queued audio sequentially, keeping is_speaking=True throughout."""
@@ -735,10 +741,13 @@ class Speaker:
             # True silence — only feeds when no real audio is flowing
             silence = b'\x00' * 4800  # 100ms of silence at 24kHz 16-bit mono
             while not self._silence_stop.is_set():
+                # Exit if pacat died unexpectedly — no point feeding a dead pipe
+                if not self._pacat_proc or self._pacat_proc.poll() is not None:
+                    break
                 try:
                     now = time.time()
                     # Only feed silence if no real audio in last 0.5s
-                    if self._pacat_proc and self._pacat_proc.poll() is None and (now - self._last_audio_write) > 0.5:
+                    if (now - self._last_audio_write) > 0.5:
                         with self.lock:
                             self._pacat_proc.stdin.write(silence)
                             self._pacat_proc.stdin.flush()
@@ -812,6 +821,7 @@ class Speaker:
 
     def _play_one(self, audio_bytes):
         """Decode and play a single audio chunk."""
+        proc = None
         try:
             vol_filter = f'volume={VOLUME / 100.0},afade=t=in:d=0.03,afade=t=out:st=99:d=0.03'
             proc = subprocess.Popen(
@@ -846,19 +856,29 @@ class Speaker:
                             self._pacat_proc.stdin.flush()
                             self._last_audio_write = time.time()
                 else:
-                    # Play via aplay — one-shot per chunk (no persistent process)
+                    # Play via aplay — one-shot per chunk (no persistent process).
+                    # Track the active process so interrupt() can kill it; ensure
+                    # cleanup runs even if write/wait throws.
+                    ap = None
                     try:
                         ap = subprocess.Popen(
                             ['aplay', '-D', 'default', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
                         )
+                        with self.lock:
+                            self._active_aplay = ap
                         ap.stdin.write(pcm)
                         ap.stdin.close()
                         ap.wait(timeout=10)
                     except Exception as e:
                         print(f"[Speaker] Error: {e}")
-                        try: ap.kill()
-                        except: pass
+                    finally:
+                        if ap and ap.poll() is None:
+                            try: ap.kill()
+                            except Exception: pass
+                        with self.lock:
+                            if getattr(self, '_active_aplay', None) is ap:
+                                self._active_aplay = None
                 # Wait for audio to actually play out before returning
                 time.sleep(playback_secs)
         except subprocess.TimeoutExpired:
@@ -866,6 +886,10 @@ class Speaker:
             subprocess.run(['killall', '-q', 'aplay', 'ffmpeg'], stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"[Speaker] Error: {e}")
+        finally:
+            if proc and proc.poll() is None:
+                try: proc.kill()
+                except Exception: pass
 
     def play_audio(self, audio_bytes, audio_format='mp3'):
         """Legacy non-queued playback."""
@@ -1059,7 +1083,10 @@ async def run():
                 last_motion_time = time.time()
                 noise_start_time = None
 
-                ws_send_queue = []
+                # deque is thread-safe for append + popleft, unlike a plain list,
+                # which is important because mic/speaker/motion threads all push
+                # messages onto this queue from outside the asyncio loop.
+                ws_send_queue = deque()
                 speaker._ws_send_queue = ws_send_queue
                 mic._ws_send_queue = ws_send_queue  # voice-interrupt path
 
@@ -1076,9 +1103,14 @@ async def run():
 
                 while running and connected:
                     try:
-                        # Send queued messages
-                        while ws_send_queue:
-                            await ws.send(ws_send_queue.pop(0))
+                        # Send queued messages — deque.popleft() is O(1) and
+                        # thread-safe; raises IndexError when empty so we use
+                        # a try/except instead of `while queue` which can race.
+                        while True:
+                            try:
+                                await ws.send(ws_send_queue.popleft())
+                            except IndexError:
+                                break
 
                         # Check for incoming messages
                         try:
@@ -1369,12 +1401,15 @@ async def run():
                                 asyncio.ensure_future(do_bt_pair())
 
                             elif msg_type == 'ap_config':
-                                # Save AP config for wifi-manager
+                                # Save AP config for wifi-manager. Path is computed
+                                # from this file's location so it works for any user,
+                                # not just the original mrcdcox install.
                                 ap_ssid = msg.get('ssid', 'Droid-Setup')
                                 ap_pw = msg.get('password', 'droid1234')
                                 try:
                                     ap_conf = {'ssid': ap_ssid, 'password': ap_pw}
-                                    with open('/home/mrcdcox/droid/ap-config.json', 'w') as f:
+                                    ap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ap-config.json')
+                                    with open(ap_path, 'w') as f:
                                         json.dump(ap_conf, f)
                                     await ws.send(json.dumps({'type': 'ap_config_result', 'success': True}))
                                     print(f'[Droid] AP config saved: {ap_ssid}')

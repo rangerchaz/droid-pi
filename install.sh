@@ -69,6 +69,15 @@ WantedBy=multi-user.target
 EOF
 
 sudo cp /tmp/droid.service /etc/systemd/system/droid.service
+
+# WiFi manager service — uses placeholder __INSTALL_DIR__ in the template
+if [ -f "$DROID_DIR/droid-wifi.service" ]; then
+    echo "⚙️  Installing droid-wifi.service..."
+    sed "s|__INSTALL_DIR__|$DROID_DIR|g" "$DROID_DIR/droid-wifi.service" \
+        | sudo tee /etc/systemd/system/droid-wifi.service >/dev/null
+    sudo systemctl enable droid-wifi >/dev/null 2>&1 || true
+fi
+
 sudo systemctl daemon-reload
 sudo systemctl enable droid
 
