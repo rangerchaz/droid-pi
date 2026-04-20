@@ -8,6 +8,23 @@ import time
 from . import config, state
 
 
+def _extract_wav_pcm(wav_bytes):
+    """Extract the PCM payload from a WAV container. ffmpeg usually emits a
+    44-byte header but non-canonical fmt chunks or embedded LIST chunks shift
+    the data offset, which silently corrupts the first few ms of audio when
+    we hardcode `[44:]`. Find the 'data' chunk explicitly instead."""
+    if not wav_bytes or len(wav_bytes) < 12:
+        return None
+    if wav_bytes[:4] != b'RIFF' or wav_bytes[8:12] != b'WAVE':
+        # Not a WAV — fall back to the old assumption so we don't drop audio.
+        return wav_bytes[44:] if len(wav_bytes) > 44 else None
+    idx = wav_bytes.find(b'data', 12)
+    if idx < 0:
+        return None
+    # 'data' (4) + size (4) = 8 bytes before the PCM samples
+    return wav_bytes[idx + 8:]
+
+
 class Speaker:
     # Audio output targets
     OUTPUT_INTERNAL = 'internal'    # Small USB speaker (UACDemoV10)
@@ -183,8 +200,8 @@ class Speaker:
             )
             wav_data, _ = proc.communicate(input=audio_bytes, timeout=30)
 
-            if wav_data and len(wav_data) > 44:
-                pcm = wav_data[44:]
+            pcm = _extract_wav_pcm(wav_data)
+            if pcm:
                 silence = b'\x00' * 1440  # 30ms at 24kHz 16-bit mono
                 pcm = silence + pcm + silence
                 playback_secs = len(pcm) / (24000 * 2)

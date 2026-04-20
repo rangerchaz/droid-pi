@@ -41,9 +41,10 @@ fi
 echo "🔒 Enabling user-session linger so PulseAudio is up at boot..."
 sudo loginctl enable-linger "$USER_NAME"
 
-# Create systemd service
+# Create systemd service — write directly to /etc/systemd via sudo tee so
+# nothing lands in /tmp where a race/cleanup could yank it before install.
 echo "⚙️  Setting up systemd service..."
-cat > /tmp/droid.service << EOF
+sudo tee /etc/systemd/system/droid.service > /dev/null << EOF
 [Unit]
 Description=Droid Client
 # Order after the user session so /run/user/$USER_ID/{pulse,bus} exist before
@@ -67,8 +68,6 @@ Environment=PULSE_SERVER=unix:/run/user/$USER_ID/pulse/native
 [Install]
 WantedBy=multi-user.target
 EOF
-
-sudo cp /tmp/droid.service /etc/systemd/system/droid.service
 
 # WiFi manager service — uses placeholder __INSTALL_DIR__ in the template
 if [ -f "$DROID_DIR/droid-wifi.service" ]; then
