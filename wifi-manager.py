@@ -251,18 +251,43 @@ CONFIG_HTML = """<!DOCTYPE html>
         var selectedSSID = '';
         var selectedSecurity = '';
         
+        // Build the list via DOM text nodes so a hostile SSID (e.g. a neighbor
+        // running a rogue AP with "</script>" in its name) can't inject HTML
+        // or JS into the portal page.
         fetch('/api/networks')
             .then(r => r.json())
             .then(networks => {
-                var html = '';
-                networks.forEach(n => {
+                var list = document.getElementById('networks');
+                list.innerHTML = '';
+                if (!networks.length) {
+                    var empty = document.createElement('p');
+                    empty.style.cssText = 'text-align:center;color:#888';
+                    empty.textContent = 'No networks found. Try refreshing.';
+                    list.appendChild(empty);
+                    return;
+                }
+                networks.forEach(function (n) {
                     var bars = n.signal > 75 ? '▂▄▆█' : n.signal > 50 ? '▂▄▆' : n.signal > 25 ? '▂▄' : '▂';
-                    html += '<div class="network" onclick="selectNetwork(\\''+n.ssid+'\\', \\''+n.security+'\\', this)">' +
-                        '<div><div class="network-name">'+n.ssid+'</div>' +
-                        '<div class="network-info">'+n.security+'</div></div>' +
-                        '<div class="signal" title="'+n.signal+'%">'+bars+'</div></div>';
+                    var row = document.createElement('div');
+                    row.className = 'network';
+                    row.addEventListener('click', function () {
+                        selectNetwork(n.ssid, n.security, row);
+                    });
+                    var left = document.createElement('div');
+                    var name = document.createElement('div');
+                    name.className = 'network-name';
+                    name.textContent = n.ssid;
+                    var info = document.createElement('div');
+                    info.className = 'network-info';
+                    info.textContent = n.security;
+                    left.appendChild(name); left.appendChild(info);
+                    var signal = document.createElement('div');
+                    signal.className = 'signal';
+                    signal.title = n.signal + '%';
+                    signal.textContent = bars;
+                    row.appendChild(left); row.appendChild(signal);
+                    list.appendChild(row);
                 });
-                document.getElementById('networks').innerHTML = html || '<p style="text-align:center;color:#888">No networks found. Try refreshing.</p>';
             });
         
         function selectNetwork(ssid, security, el) {
@@ -290,15 +315,26 @@ CONFIG_HTML = """<!DOCTYPE html>
             .then(result => {
                 document.getElementById('loader').classList.remove('active');
                 document.getElementById('connect-btn').disabled = false;
+                var status = document.getElementById('status');
+                status.innerHTML = '';
+                var msg = document.createElement('div');
                 if (result.success) {
-                    document.getElementById('status').innerHTML = '<div class="status success">✅ Connected to ' + selectedSSID + '! Droid is restarting...</div>';
+                    msg.className = 'status success';
+                    msg.textContent = '✅ Connected to ' + selectedSSID + '! Droid is restarting...';
                 } else {
-                    document.getElementById('status').innerHTML = '<div class="status error">❌ ' + result.error + '</div>';
+                    msg.className = 'status error';
+                    msg.textContent = '❌ ' + (result.error || 'Connection failed');
                 }
+                status.appendChild(msg);
             })
             .catch(() => {
                 document.getElementById('loader').classList.remove('active');
-                document.getElementById('status').innerHTML = '<div class="status success">✅ Connecting... If this page stops loading, the droid switched networks successfully!</div>';
+                var status = document.getElementById('status');
+                status.innerHTML = '';
+                var msg = document.createElement('div');
+                msg.className = 'status success';
+                msg.textContent = '✅ Connecting... If this page stops loading, the droid switched networks successfully!';
+                status.appendChild(msg);
             });
         }
     </script>
@@ -342,11 +378,48 @@ class ConfigHandler(BaseHTTPRequestHandler):
             }).encode())
 
 
+_config_server_lock = threading.Lock()
+_config_server_instance = None
+
+
 def run_config_server():
-    """Start the config portal web server."""
-    server = HTTPServer(('0.0.0.0', CONFIG_PORT), ConfigHandler)
+    """Start the config portal web server. Safe to call multiple times —
+    the second call no-ops if the first is still alive."""
+    global _config_server_instance
+    with _config_server_lock:
+        if _config_server_instance is not None:
+            print("[WiFi] Config portal already running")
+            return
+        try:
+            _config_server_instance = HTTPServer(('0.0.0.0', CONFIG_PORT), ConfigHandler)
+        except OSError as e:
+            print(f"[WiFi] Could not bind config portal on port {CONFIG_PORT}: {e}")
+            _config_server_instance = None
+            return
     print(f"[WiFi] Config portal running on port {CONFIG_PORT}")
-    server.serve_forever()
+    try:
+        _config_server_instance.serve_forever()
+    finally:
+        with _config_server_lock:
+            try:
+                _config_server_instance.server_close()
+            except Exception:
+                pass
+            _config_server_instance = None
+
+
+def stop_config_server():
+    """Shut down the portal so it's not reachable once the droid rejoins a
+    real network. Without this, anyone on the home LAN could POST
+    /api/connect and reconfigure the device."""
+    global _config_server_instance
+    with _config_server_lock:
+        srv = _config_server_instance
+    if srv is not None:
+        try:
+            srv.shutdown()  # unblocks serve_forever() → finally cleans up
+        except Exception as e:
+            print(f"[WiFi] Config portal shutdown error: {e}")
 
 
 def main():
@@ -377,6 +450,9 @@ def main():
                 disconnect_time = None
                 if ap_active:
                     stop_ap()
+                    # Kill the portal too — otherwise anyone on the home
+                    # network can POST /api/connect and reconfigure the droid.
+                    stop_config_server()
         else:
             if disconnect_time is None:
                 disconnect_time = time.time()

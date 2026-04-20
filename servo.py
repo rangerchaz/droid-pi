@@ -92,8 +92,11 @@ class ServoController:
             self._thread.start()
 
     def _angle_to_duty(self, angle):
-        """Convert angle (0-180) to duty cycle for SG90."""
-        return 2.5 + (angle / 180.0) * 10.0
+        """Convert angle (0–180°) to PWM duty cycle (%) for SG90 at 50 Hz.
+        SG90 spec: 1 ms pulse = 0°, 2 ms pulse = 180° → 5–10% duty on a
+        20 ms period. Previous formula mapped 0° → 0.5 ms and 180° → 2.5 ms,
+        which left the servo stalling against its end stops."""
+        return 5.0 + (angle / 180.0) * 5.0
 
     def _set_angle(self, channel, angle):
         """Set a servo to a specific angle."""
