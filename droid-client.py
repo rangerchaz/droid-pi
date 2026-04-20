@@ -209,6 +209,12 @@ async def run():
                 print("[Droid] Connected!")
                 connected = True
 
+                # Drop any mic audio buffered during startup — system sounds,
+                # speaker pops, or ambient noise captured before the WS
+                # handshake would otherwise ship instantly and Whisper would
+                # hallucinate user speech, triggering false interrupts.
+                mic.get_audio()
+
                 # Reset state on connect
                 state.sleep_state = 'awake'
                 state.last_motion_time = time.time()
