@@ -1,12 +1,26 @@
 """USB microphone capture with health monitor and voice-interrupt hook."""
 import json
 import re
+import subprocess
 import threading
 import time
 
 import pyaudio
 
 from .config import FORMAT, MIC_CHANNELS, SAMPLE_RATE, CHUNK
+
+
+def _aec_active():
+    """True if PulseAudio has module-echo-cancel loaded. When active, the
+    PulseAudio default source is the echo-cancelled virtual source, so we
+    should capture via the PyAudio 'pulse'/'default' device rather than
+    binding directly to the raw hw mic (which would bypass AEC)."""
+    try:
+        r = subprocess.run(['pactl', 'list', 'short', 'modules'],
+                           capture_output=True, text=True, timeout=3)
+        return r.returncode == 0 and 'module-echo-cancel' in r.stdout
+    except Exception:
+        return False
 
 
 class Microphone:
@@ -31,7 +45,20 @@ class Microphone:
         self._speaker = None        # set externally so we can call speaker.interrupt()
 
     def _find_capture_device(self):
-        """Find the USB webcam mic — try all PyAudio devices with input channels."""
+        """Pick a PyAudio input device. When PulseAudio echo-cancel is
+        active, prefer the PyAudio 'pulse'/'default' device so we read
+        the AEC virtual source (clean mic). Otherwise fall back to direct
+        hw capture from the Logitech USB webcam mic."""
+        if _aec_active():
+            for i in range(self.pa.get_device_count()):
+                try:
+                    d = self.pa.get_device_info_by_index(i)
+                    if d['maxInputChannels'] > 0 and d.get('name', '').lower() in ('pulse', 'default'):
+                        print(f'[Mic] AEC active — using PulseAudio device {i}: {d["name"]}')
+                        return i
+                except Exception:
+                    continue
+            print('[Mic] AEC active but no pulse/default PyAudio device — falling back to raw hw')
         try:
             with open('/proc/asound/cards') as f:
                 for line in f:
