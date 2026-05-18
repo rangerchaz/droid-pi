@@ -30,17 +30,13 @@ class MusicPlayer:
         self.playing = True
         self._ws_send_queue = ws_send_queue
         try:
-            audio_out = getattr(self._speaker, 'audio_output', OUTPUT_EXTERNAL) if self._speaker else OUTPUT_EXTERNAL
-            if audio_out == OUTPUT_EXTERNAL and os.path.exists('/proc/asound/Audio'):
-                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:Audio']
-            elif audio_out == OUTPUT_INTERNAL and os.path.exists('/proc/asound/UACDemoV10'):
-                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:UACDemoV10']
-            elif audio_out == OUTPUT_BT:
-                ao_args = ['--ao=pulse']
-            elif os.path.exists('/proc/asound/Audio'):
-                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:Audio']
-            else:
-                ao_args = ['--ao=alsa', '--audio-device=alsa/plughw:UACDemoV10']
+            # Route through PulseAudio so we don't fight the speaker.py
+            # path (also pulse) for the same ALSA hardware. With PA
+            # holding the Jieli sink for TTS playback, mpv's direct
+            # `plughw:UACDemoV10` would lose the race and play silently.
+            # Going through pulse also lets module-echo-cancel use the
+            # music as a reference signal so the mic doesn't pick it up.
+            ao_args = ['--ao=pulse']
             af_args = ['--af=lavfi=[highpass=f=80]']
             self.process = subprocess.Popen(
                 ['mpv', '--no-video', '--really-quiet'] + ao_args + af_args + [
