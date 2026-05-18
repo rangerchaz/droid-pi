@@ -48,6 +48,17 @@ class MusicPlayer:
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
+            # Tell the server playback has started so it can sync
+            # device.musicPlaying = true. Server uses that flag for
+            # wake-word-gated listening + ducking. Without this, a server
+            # restart mid-music leaves the server thinking nothing is
+            # playing and the droid effectively goes deaf.
+            if self._ws_send_queue is not None:
+                self._ws_send_queue.append(json.dumps({
+                    'type': 'music_started',
+                    'title': title or '',
+                }))
+
             def _wait():
                 self.process.wait()
                 was_playing = self.playing
@@ -66,6 +77,7 @@ class MusicPlayer:
             self.playing = False
 
     def stop(self):
+        was_playing = self.playing
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -75,6 +87,10 @@ class MusicPlayer:
         self.process = None
         self.playing = False
         self.title = None
+        # Server tracks musicPlaying for the wake-word gate. Tell it
+        # we've stopped if we were actually playing.
+        if was_playing and self._ws_send_queue is not None:
+            self._ws_send_queue.append(json.dumps({'type': 'music_finished'}))
 
     def toggle_pause(self):
         if self.process and self.process.poll() is None:
