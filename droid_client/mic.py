@@ -4,6 +4,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 
 import pyaudio
 
@@ -37,7 +38,11 @@ class Microphone:
         self.stream = None
         self.buffer = []
         self.lock = threading.Lock()
-        self.enabled = True
+        self._enabled = True
+        # Recent audio captured while disabled. Replayed into the main buffer
+        # when mic flips back on, so the user's first words after the droid
+        # finishes speaking aren't lost in the playback_done → mic_on round trip.
+        self._lookback = deque(maxlen=2)  # ~1s at 500ms chunks
         self.last_callback_time = time.time()
         self._health_thread = None
         self._health_stop = threading.Event()
@@ -169,10 +174,24 @@ class Microphone:
                 else:
                     print("[Mic] ❌ Rebuild failed — will retry in 10s")
 
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value):
+        prev = self._enabled
+        self._enabled = bool(value)
+        # On disabled → enabled, splice the lookback ring into the main buffer.
+        # Recovers user audio captured during the playback_done → mic_on window.
+        if self._enabled and not prev:
+            with self.lock:
+                if self._lookback:
+                    self.buffer = list(self._lookback) + self.buffer
+                    self._lookback.clear()
+
     def _callback(self, data, frame_count, time_info, status):
         self.last_callback_time = time.time()
-        if not self.enabled:
-            return (None, pyaudio.paContinue)  # keep stream alive, discard data
 
         # Downmix stereo to mono if hardware came up as 2-channel
         if getattr(self, '_actual_channels', MIC_CHANNELS) == 2:
@@ -182,6 +201,11 @@ class Microphone:
             right = samples[1::2]
             mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
             data = mono.tobytes()
+
+        if not self._enabled:
+            # Keep stream alive; stash recent audio so it can be replayed on mic_on.
+            self._lookback.append(data)
+            return (None, pyaudio.paContinue)
 
         # Buffer continuously, including during is_speaking. The server compares
         # the transcript to what the droid recently said and drops echo there.

@@ -25,7 +25,11 @@ class MusicPlayer:
         self._speaker = None  # set externally for output-target lookup
 
     def play(self, url, title='Unknown', ws_send_queue=None):
-        self.stop()
+        # Replacing the current track — kill the previous mpv without
+        # emitting music_finished. Otherwise the server treats the kill as
+        # a natural song-end and advances the queue, which races the
+        # incoming music_play and cascades the whole queue to silence.
+        self.stop(_emit=False)
         self.title = title
         self.playing = True
         self._ws_send_queue = ws_send_queue
@@ -76,7 +80,7 @@ class MusicPlayer:
             print(f'[Music] ERROR: {e}')
             self.playing = False
 
-    def stop(self):
+    def stop(self, _emit=True):
         was_playing = self.playing
         if self.process and self.process.poll() is None:
             self.process.terminate()
@@ -89,7 +93,7 @@ class MusicPlayer:
         self.title = None
         # Server tracks musicPlaying for the wake-word gate. Tell it
         # we've stopped if we were actually playing.
-        if was_playing and self._ws_send_queue is not None:
+        if was_playing and self._ws_send_queue is not None and _emit:
             self._ws_send_queue.append(json.dumps({'type': 'music_finished'}))
 
     def toggle_pause(self):
