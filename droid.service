@@ -7,10 +7,21 @@ Wants=network-online.target user@%U.service
 
 [Service]
 Type=simple
+# Power-cycle the camera USB port before starting. The Logitech C260 on
+# Pi 3B occasionally cold-boots into a wedged state (-71 / can't set
+# config #1), and any prior ungraceful exit can leave dangling UVC URBs
+# that produce the same wedge. uhubctl-driven port reset clears both.
+# -l 1-1 = LAN9514 hub, -p 3 = camera port. ExecStartPre exit code is
+# ignored (=-) so a transient uhubctl failure doesn't block startup.
+ExecStartPre=-/usr/bin/sudo /usr/sbin/uhubctl -a cycle -p 3 -l 1-1 -d 3
 ExecStart=/usr/bin/python3 %h/droid/droid-client.py
 WorkingDirectory=%h/droid
 Restart=always
 RestartSec=5
+# Give signal_handler time to release the camera before SIGKILL. The
+# old default (90s) is too long for boot but the camera URB drain
+# only needs a second or two.
+TimeoutStopSec=10
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=%h
 Environment=XDG_RUNTIME_DIR=/run/user/%U

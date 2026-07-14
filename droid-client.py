@@ -61,6 +61,15 @@ def signal_handler(sig, frame):
         os._exit(0)
     print("\nShutting down...")
     state.running = False
+    # Release the camera synchronously so UVC URBs drain before systemd
+    # SIGKILLs us. Without this, restarts wedge the camera into a -71
+    # error state that needs a USB power-cycle to recover.
+    try:
+        if camera is not None and camera.cap is not None:
+            camera.cap.release()
+            print("[Camera] Released on signal")
+    except Exception as e:
+        print(f"[Camera] Release on signal failed: {e}")
 
 
 signal.signal(signal.SIGINT, signal_handler)
