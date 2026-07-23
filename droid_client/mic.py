@@ -8,7 +8,7 @@ from collections import deque
 
 import pyaudio
 
-from .config import FORMAT, MIC_CHANNELS, SAMPLE_RATE, CHUNK
+from .config import FORMAT, MIC_CHANNELS, MIC_GAIN, SAMPLE_RATE, CHUNK
 
 
 def _aec_active():
@@ -201,6 +201,14 @@ class Microphone:
             right = samples[1::2]
             mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
             data = mono.tobytes()
+
+        if MIC_GAIN != 1.0:
+            import array
+            samples = array.array('h', data)
+            for i in range(len(samples)):
+                v = int(samples[i] * MIC_GAIN)
+                samples[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
+            data = samples.tobytes()
 
         if not self._enabled:
             # Keep stream alive; stash recent audio so it can be replayed on mic_on.

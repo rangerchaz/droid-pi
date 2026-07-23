@@ -38,6 +38,11 @@ IDLE_TIMEOUT = _g('idle_timeout', 30)
 MOTION_THRESHOLD = _g('motion_threshold', 5)
 MOTION_PIXEL_PCT = _g('motion_pixel_pct', 0.5)
 RMS_THRESHOLD = _g('rms_threshold', 500)
+
+# Software mic gain applied to captured samples before anything reads them.
+# Lav mics with 0dB-max USB interfaces (Saramonic LavMicro-U) capture ~10dB
+# below what the VAD/STT chain was tuned for; 3.0 ≈ +9.5dB.
+MIC_GAIN = float(_g('mic_gain', 1.0))
 WAKE_DEBOUNCE = _g('wake_debounce', 0.5)
 SLEEP_ENABLED = _g('sleep_enabled', True)
 
