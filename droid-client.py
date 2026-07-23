@@ -55,6 +55,17 @@ motion_tracker = None
 servo_controller = None
 
 
+def _device_mac():
+    """Stable hardware id for droid pairing (server matches droids.device_id)."""
+    for iface in ('wlan0', 'eth0'):
+        try:
+            with open('/sys/class/net/%s/address' % iface) as f:
+                return f.read().strip().upper()
+        except Exception:
+            continue
+    return None
+
+
 def signal_handler(sig, frame):
     if not state.running:
         print("\nForce quit.")
@@ -238,6 +249,7 @@ async def run():
 
                 await ws.send(json.dumps({
                     'type': 'device_info',
+                    'device_id': _device_mac(),
                     'platform': 'raspberry_pi',
                     'model': 'Pi 3 Model B',
                     'version': CLIENT_VERSION,
