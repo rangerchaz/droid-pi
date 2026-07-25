@@ -55,6 +55,56 @@ class Speaker:
         self._last_audio_write = 0
         self._mic_ref = None         # set externally — for echo flush (legacy)
         self._ws_send_queue = None   # set externally
+        # Deferred: pulse may not be up yet at boot, so the default sink is
+        # pointed on first playback instead of here.
+        self._sink_pointed = False
+
+    # ---------------------------------------------------------------- output
+    def set_output(self, target):
+        """Switch output target so it actually takes effect: move the Pulse
+        default sink and drop the persistent aplay stream so the next write
+        reopens on the new route."""
+        self.audio_output = target
+        self.use_pulse = (target == self.OUTPUT_BT)
+        self._stop_aplay_stream()
+        self._sink_pointed = False
+        self._ensure_sink()
+
+    def _ensure_sink(self):
+        if not self._sink_pointed:
+            self._point_default_sink()
+            self._sink_pointed = True
+
+    def _point_default_sink(self):
+        """Under PulseAudio every stream (speech, PCM, mpv music) lands on
+        the default sink, so the output switch must move it or it's a no-op —
+        and after a reboot the sink can come up on a dead device, which plays
+        everything as silence with no errors."""
+        if not self._pulse_available():
+            return
+        try:
+            r = subprocess.run(['pactl', 'list', 'sinks', 'short'],
+                               capture_output=True, text=True, timeout=3)
+            sinks = [ln.split('\t')[1] for ln in r.stdout.splitlines() if '\t' in ln]
+        except Exception as e:
+            print(f'[Speaker] pactl list sinks failed: {e}')
+            return
+        def first(pred):
+            return next((s for s in sinks if pred(s.lower())), None)
+        if self.audio_output == self.OUTPUT_BT:
+            sink = first(lambda s: 'bluez' in s)
+        elif self.audio_output == self.OUTPUT_INTERNAL:
+            sink = first(lambda s: 'uac' in s)
+        else:  # external: any real output that isn't the small USB speaker, BT, or HDMI
+            sink = first(lambda s: 'uac' not in s and 'bluez' not in s and 'hdmi' not in s)
+        if not sink:
+            print(f'[Speaker] No pulse sink for {self.audio_output} (sinks: {sinks})')
+            return
+        try:
+            subprocess.run(['pactl', 'set-default-sink', sink], capture_output=True, timeout=3)
+            print(f'[Speaker] Default sink -> {sink}')
+        except Exception as e:
+            print(f'[Speaker] set-default-sink failed: {e}')
 
     # ---------------------------------------------------------------- queue
     def enqueue(self, audio_bytes, audio_format='mp3', text='', rate=24000, channels=1):
@@ -226,8 +276,9 @@ class Speaker:
                 else:
                     ap = None
                     try:
+                        self._ensure_sink()
                         ap = subprocess.Popen(
-                            ['aplay', '-D', 'default', '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
+                            ['aplay', '-D', self._get_aplay_device(), '-f', 'S16_LE', '-r', '24000', '-c', '1', '-'],
                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         )
                         with self.lock:
@@ -292,6 +343,7 @@ class Speaker:
     def _ensure_aplay_stream(self, rate=24000, channels=1):
         if self._aplay_proc and self._aplay_proc.poll() is None:
             return
+        self._ensure_sink()
         device = self._get_aplay_device()
         try:
             self._aplay_proc = subprocess.Popen(

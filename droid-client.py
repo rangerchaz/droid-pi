@@ -323,16 +323,13 @@ async def run():
                             elif msg_type == 'audio_output':
                                 target = msg.get('target', 'internal')
                                 if target in ('external', 'aux', 'headphone'):
-                                    speaker.audio_output = Speaker.OUTPUT_EXTERNAL
-                                    speaker.use_pulse = False
+                                    speaker.set_output(Speaker.OUTPUT_EXTERNAL)
                                     print('[Speaker] Switched to external speaker')
                                 elif target in ('internal', 'usb'):
-                                    speaker.audio_output = Speaker.OUTPUT_INTERNAL
-                                    speaker.use_pulse = False
+                                    speaker.set_output(Speaker.OUTPUT_INTERNAL)
                                     print('[Speaker] Switched to internal speaker')
                                 elif target == 'bluetooth':
-                                    speaker.audio_output = Speaker.OUTPUT_BT
-                                    speaker.use_pulse = True
+                                    speaker.set_output(Speaker.OUTPUT_BT)
                                     print('[Speaker] Switched to Bluetooth')
 
                             elif msg_type == 'camera_off':
@@ -394,16 +391,9 @@ async def run():
                                 asyncio.ensure_future(do_bt_on())
 
                             elif msg_type == 'bluetooth_off':
-                                import subprocess
                                 try:
                                     speaker._stop_bt_stream()
-                                    subprocess.run(['bash', '-c', '''
-                                        USB_SINK=$(pactl list sinks short | grep -i uac | awk '{print $2}')
-                                        if [ -n "$USB_SINK" ]; then
-                                            pactl set-default-sink "$USB_SINK"
-                                        fi
-                                    '''], capture_output=True, text=True, timeout=5)
-                                    speaker.use_pulse = False
+                                    speaker.set_output(Speaker.OUTPUT_INTERNAL)
                                     print('[Droid] Switched to USB speaker')
                                 except Exception as e:
                                     print(f'[Droid] Speaker switch error: {e}')
