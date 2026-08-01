@@ -8,7 +8,7 @@ from collections import deque
 
 import pyaudio
 
-from .config import FORMAT, MIC_CHANNELS, MIC_GAIN, SAMPLE_RATE, CHUNK
+from .config import FORMAT, MIC_CHANNELS, MIC_GAIN, MIC_HIGHPASS_HZ, SAMPLE_RATE, CHUNK
 
 
 def _aec_active():
@@ -202,12 +202,36 @@ class Microphone:
             mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
             data = mono.tobytes()
 
-        if MIC_GAIN != 1.0:
-            import array
+        if MIC_HIGHPASS_HZ > 0 or MIC_GAIN != 1.0:
+            import array, math
             samples = array.array('h', data)
-            for i in range(len(samples)):
-                v = int(samples[i] * MIC_GAIN)
-                samples[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
+            if MIC_HIGHPASS_HZ > 0:
+                # Two cascaded RBJ high-pass biquads (24dB/oct), state carried
+                # across chunks so there's no click at chunk boundaries.
+                if not hasattr(self, '_hp_coef'):
+                    w0 = 2.0 * math.pi * MIC_HIGHPASS_HZ / SAMPLE_RATE
+                    cw, sw = math.cos(w0), math.sin(w0)
+                    alpha = sw / (2.0 * 0.707)
+                    a0 = 1.0 + alpha
+                    self._hp_coef = ((1.0 + cw) / (2.0 * a0), -(1.0 + cw) / a0,
+                                     (1.0 + cw) / (2.0 * a0), -2.0 * cw / a0,
+                                     (1.0 - alpha) / a0)
+                    self._hp_state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                b0, b1, b2, a1, a2 = self._hp_coef
+                x1a, x2a, y1a, y2a, x1b, x2b, y1b, y2b = self._hp_state
+                for i in range(len(samples)):
+                    x = float(samples[i])
+                    y = b0 * x + b1 * x1a + b2 * x2a - a1 * y1a - a2 * y2a
+                    x2a, x1a, y2a, y1a = x1a, x, y1a, y
+                    z = b0 * y + b1 * x1b + b2 * x2b - a1 * y1b - a2 * y2b
+                    x2b, x1b, y2b, y1b = x1b, y, y1b, z
+                    v = int(z * MIC_GAIN)
+                    samples[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
+                self._hp_state = [x1a, x2a, y1a, y2a, x1b, x2b, y1b, y2b]
+            else:
+                for i in range(len(samples)):
+                    v = int(samples[i] * MIC_GAIN)
+                    samples[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
             data = samples.tobytes()
 
         if not self._enabled:

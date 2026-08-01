@@ -1,6 +1,7 @@
 """Speaker: audio playback queue, persistent aplay/pacat, interrupt support."""
 import json
 import os
+import select
 import subprocess
 import threading
 import time
@@ -55,6 +56,64 @@ class Speaker:
         self._last_audio_write = 0
         self._mic_ref = None         # set externally — for echo flush (legacy)
         self._ws_send_queue = None   # set externally
+        self._speak_started = 0
+        # THE WEDGE FIX: a blocking stdin.write to a stalled aplay/pacat used
+        # to hang the queue thread forever (is_speaking stuck, playback_done
+        # never sent, restart-only recovery). Writes are now deadline-bounded
+        # and this watchdog force-recovers anything that still gets stuck.
+        threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def _watchdog(self):
+        while True:
+            time.sleep(5)
+            try:
+                if state.is_speaking and self._speak_started and \
+                        (time.time() - self._speak_started) > 60:
+                    print('[Speaker] WATCHDOG: playback stuck >60s — force recovery')
+                    self._interrupted = True
+                    with self.queue_lock:
+                        self.queue.clear()
+                    for proc in (self._aplay_proc, self._pacat_proc, self._active_aplay):
+                        if proc and proc.poll() is None:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    self._aplay_proc = None
+                    self._pacat_proc = None
+                    state.is_speaking = False
+                    self._speak_started = 0
+                    with self.queue_lock:
+                        self._playing = False
+                    if self._ws_send_queue is not None:
+                        self._ws_send_queue.append(json.dumps({'type': 'playback_done'}))
+            except Exception as e:
+                print(f'[Speaker] watchdog error: {e}')
+
+    def _write_deadline(self, proc, data, deadline_s):
+        """Write PCM to a pipe without ever blocking forever. Returns False if
+        the sink stopped consuming (caller should respawn the stream)."""
+        try:
+            fd = proc.stdin.fileno()
+            os.set_blocking(fd, False)
+            view = memoryview(data)
+            off = 0
+            end = time.time() + deadline_s
+            while off < len(view):
+                if time.time() > end or self._interrupted:
+                    return False
+                _, writable, _ = select.select([], [fd], [], 0.25)
+                if not writable:
+                    continue
+                try:
+                    off += os.write(fd, view[off:off + 8192])
+                except BlockingIOError:
+                    continue
+                except (BrokenPipeError, OSError):
+                    return False
+            return True
+        except Exception:
+            return False
 
     # ---------------------------------------------------------------- queue
     def enqueue(self, audio_bytes, audio_format='mp3', text='', rate=24000, channels=1):
@@ -85,6 +144,7 @@ class Speaker:
     def _play_queue(self):
         """Play all queued audio sequentially, keeping state.is_speaking=True throughout."""
         state.is_speaking = True
+        self._speak_started = time.time()
         self._interrupted = False
         try:
             while not self._interrupted:
@@ -92,6 +152,7 @@ class Speaker:
                     if not self.queue:
                         break
                     audio_bytes, audio_format, text, rate, channels = self.queue.pop(0)
+                self._speak_started = time.time()   # watchdog clock per item
                 if audio_format == 'pcm':
                     self._play_pcm(audio_bytes, rate, channels)
                 else:
@@ -99,6 +160,7 @@ class Speaker:
         finally:
             time.sleep(0.3)
             state.is_speaking = False
+            self._speak_started = 0
             if self._ws_send_queue is not None:
                 self._ws_send_queue.append(json.dumps({'type': 'playback_done'}))
             with self.queue_lock:
@@ -126,6 +188,8 @@ class Speaker:
                         with self.lock:
                             self._pacat_proc.stdin.write(silence)
                             self._pacat_proc.stdin.flush()
+                except BlockingIOError:
+                    pass   # pipe momentarily full (fd is non-blocking now) — skip this beat
                 except (BrokenPipeError, OSError):
                     break
                 self._silence_stop.wait(0.1)
@@ -157,34 +221,41 @@ class Speaker:
             silence = b'\x00' * (rate * 2 * channels // 30)  # ~33ms
             pcm_bytes = silence + pcm_bytes + silence
 
+            secs = len(pcm_bytes) / (rate * 2 * channels)
             if self.use_pulse:
                 if self._pacat_proc is None or self._pacat_proc.poll() is not None:
                     self._start_bt_stream()
-                try:
-                    with self.lock:
-                        self._last_audio_write = time.time()
-                        self._pacat_proc.stdin.write(pcm_bytes)
-                        self._pacat_proc.stdin.flush()
-                        self._last_audio_write = time.time()
-                except (BrokenPipeError, OSError):
+                with self.lock:
+                    self._last_audio_write = time.time()
+                    ok = self._write_deadline(self._pacat_proc, pcm_bytes, secs + 5)
+                    self._last_audio_write = time.time()
+                if not ok and not self._interrupted:
+                    print('[Speaker] pacat stalled — respawning stream')
                     self._start_bt_stream()
                     if self._pacat_proc and self._pacat_proc.poll() is None:
                         with self.lock:
                             self._last_audio_write = time.time()
-                            self._pacat_proc.stdin.write(pcm_bytes)
-                            self._pacat_proc.stdin.flush()
-                time.sleep(len(pcm_bytes) / (rate * 2 * channels))
+                            ok = self._write_deadline(self._pacat_proc, pcm_bytes, secs + 5)
+                if ok:
+                    time.sleep(secs)
             else:
                 self._ensure_aplay_stream(rate, channels)
                 if self._aplay_proc and self._aplay_proc.poll() is None:
-                    try:
-                        with self.lock:
-                            self._aplay_proc.stdin.write(pcm_bytes)
-                            self._aplay_proc.stdin.flush()
-                        time.sleep(len(pcm_bytes) / (rate * 2 * channels))
-                    except (BrokenPipeError, OSError):
-                        print('[Speaker] aplay pipe broken — restarting stream')
+                    with self.lock:
+                        ok = self._write_deadline(self._aplay_proc, pcm_bytes, secs + 5)
+                    if not ok and not self._interrupted:
+                        print('[Speaker] aplay stalled — respawning stream')
+                        try:
+                            self._aplay_proc.kill()
+                        except Exception:
+                            pass
                         self._aplay_proc = None
+                        self._ensure_aplay_stream(rate, channels)
+                        if self._aplay_proc and self._aplay_proc.poll() is None:
+                            with self.lock:
+                                ok = self._write_deadline(self._aplay_proc, pcm_bytes, secs + 5)
+                    if ok:
+                        time.sleep(secs)
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
 
@@ -209,19 +280,16 @@ class Speaker:
                 if self.use_pulse:
                     if self._pacat_proc is None or self._pacat_proc.poll() is not None:
                         self._start_bt_stream()
-                    try:
-                        with self.lock:
-                            self._last_audio_write = time.time()
-                            self._pacat_proc.stdin.write(pcm)
-                            self._pacat_proc.stdin.flush()
-                            self._last_audio_write = time.time()
-                    except (BrokenPipeError, OSError):
+                    with self.lock:
+                        self._last_audio_write = time.time()
+                        ok = self._write_deadline(self._pacat_proc, pcm, playback_secs + 5)
+                        self._last_audio_write = time.time()
+                    if not ok and not self._interrupted:
                         self._start_bt_stream()
                         if self._pacat_proc and self._pacat_proc.poll() is None:
                             with self.lock:
                                 self._last_audio_write = time.time()
-                                self._pacat_proc.stdin.write(pcm)
-                                self._pacat_proc.stdin.flush()
+                                self._write_deadline(self._pacat_proc, pcm, playback_secs + 5)
                                 self._last_audio_write = time.time()
                 else:
                     ap = None

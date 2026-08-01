@@ -43,6 +43,10 @@ RMS_THRESHOLD = _g('rms_threshold', 500)
 # Lav mics with 0dB-max USB interfaces (Saramonic LavMicro-U) capture ~10dB
 # below what the VAD/STT chain was tuned for; 3.0 ≈ +9.5dB.
 MIC_GAIN = float(_g('mic_gain', 1.0))
+
+# High-pass cutoff in Hz (0 = off). Kills power-supply ground hum (40-140Hz)
+# that noisy USB chargers inject into USB mic ADCs; speech formants sit above.
+MIC_HIGHPASS_HZ = float(_g('mic_highpass_hz', 0))
 WAKE_DEBOUNCE = _g('wake_debounce', 0.5)
 SLEEP_ENABLED = _g('sleep_enabled', True)
 
