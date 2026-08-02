@@ -17,7 +17,7 @@ echo ""
 echo "📦 Installing dependencies..."
 sudo apt update -qq
 sudo apt install -y -qq python3-pip python3-opencv python3-pyaudio \
-  portaudio19-dev ffmpeg pulseaudio 2>/dev/null
+  portaudio19-dev ffmpeg pulseaudio uhubctl 2>/dev/null
 
 pip3 install -q websockets 2>/dev/null || pip3 install --break-system-packages -q websockets
 
@@ -28,7 +28,7 @@ if [ ! -f "$DROID_DIR/config.json" ]; then
   echo "⚠️  Edit config.json and paste your device token:"
   echo "   nano $DROID_DIR/config.json"
   echo ""
-  echo "   Get your token from: https://droid.turkeycode.ai"
+  echo "   Get your token from: https://meckie.ai"
   echo "   Dashboard → Hardware → Generate Device Token"
   echo ""
 fi
@@ -55,10 +55,18 @@ Wants=network-online.target user@$USER_ID.service
 [Service]
 Type=simple
 User=$USER_NAME
+# Power-cycle the USB ports before starting. Budget webcams (Logitech
+# C260/C270 especially) occasionally cold-boot into a wedged -71 state,
+# and ungraceful exits can leave dangling UVC URBs with the same result.
+# Leading '-' ignores failure so a missing uhubctl never blocks startup.
+ExecStartPre=-/usr/bin/sudo /usr/sbin/uhubctl -a cycle -p 2-5 -l 1-1 -d 3
 ExecStart=/usr/bin/python3 $DROID_DIR/droid-client.py
 WorkingDirectory=$DROID_DIR
 Restart=always
 RestartSec=5
+# signal_handler releases the camera on SIGTERM in a second or two; the
+# 90s systemd default just delays reboots.
+TimeoutStopSec=10
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/$USER_NAME
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
@@ -92,5 +100,5 @@ echo ""
 TOKEN=$(python3 -c "import json; print(json.load(open('$DROID_DIR/config.json')).get('token',''))" 2>/dev/null || echo "")
 if [ "$TOKEN" = "paste-your-device-token-here" ] || [ -z "$TOKEN" ]; then
   echo "⚠️  Don't forget to add your device token to config.json!"
-  echo "   Get it from: https://droid.turkeycode.ai → Dashboard → Hardware"
+  echo "   Get it from: https://meckie.ai → Dashboard → Hardware"
 fi
