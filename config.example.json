@@ -4,5 +4,5 @@
   "volume": 250,
   "idle_timeout": 60,
   "rms_threshold": 200,
-  "sleep_enabled": true
+  "sleep_enabled": false
 }
