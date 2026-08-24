@@ -247,6 +247,24 @@ async def run():
                 speaker._ws_send_queue = ws_send_queue
                 mic._ws_send_queue = ws_send_queue
 
+                # Fast outbox: the main loop laps in seconds (camera +
+                # face work), so playback_done and other events sat
+                # queued far too long — the show runner's half-duplex
+                # stage timed out waiting and robots talked over each
+                # other. Drain the queue every 100ms independently.
+                async def _fast_flush():
+                    while state.running:
+                        try:
+                            while True:
+                                try:
+                                    await ws.send(ws_send_queue.popleft())
+                                except IndexError:
+                                    break
+                        except Exception:
+                            return
+                        await asyncio.sleep(0.1)
+                _flush_task = asyncio.create_task(_fast_flush())
+
                 await ws.send(json.dumps({
                     'type': 'device_info',
                     'device_id': _device_mac(),
