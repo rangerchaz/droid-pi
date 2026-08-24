@@ -207,15 +207,19 @@ async def run():
                     talking = bool(state.is_speaking)
                     if talking and servo_controller:
                         was_talking = True
+                        # GENTLE: servo spikes share the 5V budget with
+                        # the speaker and the C260 — the first cut of
+                        # this (big sways at 0.7s) browned the webcam
+                        # off the bus every time she spoke.
                         servo_controller.look_at(
-                            max(60, min(120, 90 + random.randint(-18, 18))),
-                            max(2, min(28, 10 + random.randint(-6, 12))))
+                            max(78, min(102, 90 + random.randint(-7, 7))),
+                            max(6, min(16, 10 + random.randint(-3, 4))))
                     elif was_talking and servo_controller:
                         was_talking = False
                         servo_controller.center()
                 except Exception:
                     pass
-                time.sleep(0.7)
+                time.sleep(2.4)
         threading.Thread(target=_talking_head, daemon=True).start()
     except Exception as e:
         print(f'[Droid] Servo not available: {e}')
