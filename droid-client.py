@@ -194,6 +194,29 @@ async def run():
     try:
         from servo import ServoController
         servo_controller = ServoController()
+
+        # Talking head: while the speaker plays, the neck moves — small
+        # conversational sways, a settle when the line ends. Robots that
+        # talk without moving read as furniture (field note from the
+        # double-act filming: 'evas head could be more animated').
+        def _talking_head():
+            import random
+            was_talking = False
+            while True:
+                try:
+                    talking = bool(state.is_speaking)
+                    if talking and servo_controller:
+                        was_talking = True
+                        servo_controller.look_at(
+                            max(60, min(120, 90 + random.randint(-18, 18))),
+                            max(2, min(28, 10 + random.randint(-6, 12))))
+                    elif was_talking and servo_controller:
+                        was_talking = False
+                        servo_controller.center()
+                except Exception:
+                    pass
+                time.sleep(0.7)
+        threading.Thread(target=_talking_head, daemon=True).start()
     except Exception as e:
         print(f'[Droid] Servo not available: {e}')
         servo_controller = None
