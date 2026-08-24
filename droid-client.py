@@ -220,10 +220,9 @@ async def run():
                 except Exception:
                     pass
                 time.sleep(1.1)
-        # DISABLED 2026-08-23: even gentled, servo moves during speech
-        # brown the C260 off the shared 5V bus. Re-enable when the
-        # servos get their own supply (hardware task).
-        # threading.Thread(target=_talking_head, daemon=True).start()
+        # Servos ride their own battery (confirmed by the owner) — the
+        # earlier camera brownouts were the webcam/USB story, not this.
+        threading.Thread(target=_talking_head, daemon=True).start()
     except Exception as e:
         print(f'[Droid] Servo not available: {e}')
         servo_controller = None
