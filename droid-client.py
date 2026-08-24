@@ -212,14 +212,14 @@ async def run():
                         # this (big sways at 0.7s) browned the webcam
                         # off the bus every time she spoke.
                         servo_controller.look_at(
-                            max(78, min(102, 90 + random.randint(-7, 7))),
-                            max(6, min(16, 10 + random.randint(-3, 4))))
+                            max(70, min(110, 90 + random.randint(-16, 16))),
+                            max(4, min(22, 10 + random.randint(-5, 9))))
                     elif was_talking and servo_controller:
                         was_talking = False
                         servo_controller.center()
                 except Exception:
                     pass
-                time.sleep(2.4)
+                time.sleep(1.1)
         # DISABLED 2026-08-23: even gentled, servo moves during speech
         # brown the C260 off the shared 5V bus. Re-enable when the
         # servos get their own supply (hardware task).
@@ -654,9 +654,13 @@ async def run():
 
                         if state.sleep_state == 'awake':
                             # === AWAKE MODE ===
-                            if (servo_controller and servo_controller.enabled and
+                            if (not state.is_speaking and
+                                    servo_controller and servo_controller.enabled and
                                     servo_controller.kit is not None and camera.enabled and
                                     camera.cap is not None and camera.cap.isOpened()):
+                                # While SPEAKING the talking head owns the
+                                # neck — the tracker was re-centering on the
+                                # nearest face every second and erasing it.
                                 if not hasattr(camera, '_last_track_time'):
                                     camera._last_track_time = 0
                                 if now - camera._last_track_time >= 1.0:
