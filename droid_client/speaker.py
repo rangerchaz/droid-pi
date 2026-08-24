@@ -222,6 +222,7 @@ class Speaker:
             pcm_bytes = silence + pcm_bytes + silence
 
             secs = len(pcm_bytes) / (rate * 2 * channels)
+            clip_t0 = time.time()   # wall clock: write-block time counts toward playback
             if self.use_pulse:
                 if self._pacat_proc is None or self._pacat_proc.poll() is not None:
                     self._start_bt_stream()
@@ -237,7 +238,7 @@ class Speaker:
                             self._last_audio_write = time.time()
                             ok = self._write_deadline(self._pacat_proc, pcm_bytes, secs + 5)
                 if ok:
-                    time.sleep(secs)
+                    time.sleep(max(0.0, secs - (time.time() - clip_t0) + 0.35))
             else:
                 self._ensure_aplay_stream(rate, channels)
                 if self._aplay_proc and self._aplay_proc.poll() is None:
@@ -255,7 +256,11 @@ class Speaker:
                             with self.lock:
                                 ok = self._write_deadline(self._aplay_proc, pcm_bytes, secs + 5)
                     if ok:
-                        time.sleep(secs)
+                        # The blocking write already consumed most of the
+                        # clip's wall time; sleeping the FULL duration again
+                        # made done-signals lag on long lines and (with
+                        # buffered short lines) lead on short ones.
+                        time.sleep(max(0.0, secs - (time.time() - clip_t0) + 0.35))
         except Exception as e:
             print(f'[Speaker] PCM play error: {e}')
 
