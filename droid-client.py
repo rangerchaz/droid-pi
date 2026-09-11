@@ -204,7 +204,7 @@ async def run():
             was_talking = False
             while True:
                 try:
-                    talking = bool(state.is_speaking)
+                    talking = bool(state.is_speaking) or time.time() < state.mime_until
                     if talking and servo_controller:
                         was_talking = True
                         # GENTLE: servo spikes share the 5V budget with
@@ -359,6 +359,14 @@ async def run():
                                     print(f"[Emote] {e}")
                                     if servo_controller:
                                         servo_controller.emote(e)
+
+                            elif msg_type == 'mime':
+                                # Puppet rail: animate as if talking for
+                                # `ms`, no audio — the PA carries the
+                                # voice, the head sways along.
+                                mime_ms = int(msg.get('ms', 3000))
+                                state.mime_until = time.time() + max(0.5, min(20, mime_ms / 1000))
+                                print(f"[Mime] head animates for {mime_ms}ms")
 
                             elif msg_type == 'done_speaking':
                                 if servo_controller:
@@ -653,7 +661,7 @@ async def run():
 
                         if state.sleep_state == 'awake':
                             # === AWAKE MODE ===
-                            if (not state.is_speaking and
+                            if (not (state.is_speaking or time.time() < state.mime_until) and
                                     servo_controller and servo_controller.enabled and
                                     servo_controller.kit is not None and camera.enabled and
                                     camera.cap is not None and camera.cap.isOpened()):

@@ -8,6 +8,10 @@ import time
 
 running = True
 is_speaking = False
+# Mime window: server-cued "animate as if talking" (no audio) — the
+# showcase puppet rail. The talking head and the face-tracker yield
+# both honor it exactly like is_speaking.
+mime_until = 0
 sleep_state = 'awake'  # 'awake' | 'sleeping'
 boot_time = time.time()  # don't auto-sleep for first 120s after boot
 last_motion_time = time.time()
